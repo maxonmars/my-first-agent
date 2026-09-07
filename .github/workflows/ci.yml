@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Линтер и формат
+        run: npm run lint:ci
+
+      - name: Типы
+        run: npm run typecheck
+
+      # Пороги покрытия заданы в vitest.config.ts.
+      - name: Тесты
+        run: npm run test:coverage
+
+      # Сборка отдельно проверяет преобразование .ts-импортов в .js.
+      - name: Сборка
+        run: npm run build

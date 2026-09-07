@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+
+# Локальные переменные окружения и секреты.
+.env
+.env.local
+
+# macOS
+.DS_Store

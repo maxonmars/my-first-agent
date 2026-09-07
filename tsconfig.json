@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    // Node исполняет .ts напрямую и не резолвит .js в .ts, поэтому сборка переписывает расширения.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    // Node поддерживает только синтаксис TypeScript, который можно удалить без преобразования.
+    "erasableSyntaxOnly": true
+  },
+  "include": ["src", "tests", "vitest.config.ts"]
+}

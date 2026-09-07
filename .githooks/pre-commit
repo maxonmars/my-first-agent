@@ -1,0 +1,9 @@
+#!/bin/sh
+# Быстрые проверки перед коммитом; полный набор запускается в CI.
+
+if ! npm run --silent lint:staged; then
+  echo "Починить: npm run lint:fix" >&2
+  exit 1
+fi
+
+npm run --silent typecheck

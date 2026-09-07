@@ -1,0 +1,32 @@
+{
+  "name": "my-first-agent",
+  "version": "0.1.0",
+  "description": "Node.js boilerplate for an AI agent",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "lint:ci": "biome check --reporter=github .",
+    "lint:staged": "biome check --staged --no-errors-on-unmatched",
+    "format": "biome format --write .",
+    "prepare": "git config core.hooksPath .githooks || exit 0"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.12",
+    "@types/node": "^24.13.3",
+    "@vitest/coverage-v8": "^5.0.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}
