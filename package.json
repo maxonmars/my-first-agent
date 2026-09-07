@@ -1,7 +1,7 @@
 {
   "name": "my-first-agent",
   "version": "0.1.0",
-  "description": "Node.js boilerplate for an AI agent",
+  "description": "Stateful CLI agent for conversations with DeepSeek",
   "type": "module",
   "scripts": {
     "dev": "node src/index.ts",
@@ -28,5 +28,10 @@
     "@vitest/coverage-v8": "^5.0.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.0"
+  },
+  "dependencies": {
+    "openai": "^7.10.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.5.4"
   }
 }
