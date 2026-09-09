@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   Agent,
   AgentBusyError,
@@ -6,13 +6,22 @@ import {
   AgentConfigError,
   AgentInputError,
   AgentResponseError,
+  type AgentResult,
 } from "../src/agent.ts";
 import { DEFAULT_AGENT_CONFIG } from "../src/config.ts";
+import type { HistoryMessage, HistoryRepository } from "../src/history.ts";
 import type { DeepSeekParams, LlmClient, LlmCompletion } from "../src/llm-client.ts";
 import { completionResponse, type FakeReply, fakeClient, systemOf } from "./support/fake-client.ts";
 
 function config(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return { ...DEFAULT_AGENT_CONFIG, ...overrides };
+}
+
+function fakeHistory(messages: HistoryMessage[] = []) {
+  return {
+    load: vi.fn<HistoryRepository["load"]>(() => messages),
+    save: vi.fn<HistoryRepository["save"]>(),
+  };
 }
 
 describe("Agent history", () => {
@@ -50,15 +59,23 @@ describe("Agent history", () => {
       new Error("API недоступен"),
       { content: "третий ответ", totalTokens: 3 },
     ]);
-    const agent = new Agent({ client: fake.client, config: config() });
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client: fake.client, config: config(), historyRepository });
 
     await agent.respond("первый вопрос");
     await expect(agent.respond("сломанный вопрос")).rejects.toThrow("API недоступен");
+    expect(historyRepository.save).toHaveBeenCalledTimes(1);
     const result = await agent.respond("третий вопрос");
 
     expect(fake.calls[2]!.messages.map((message) => message.role)).toEqual(["system", "user", "assistant", "user"]);
     expect(fake.calls[2]!.messages).not.toContainEqual({ role: "user", content: "сломанный вопрос" });
     expect(result.usage.session.totalTokens).toBe(8);
+    expect(historyRepository.save).toHaveBeenLastCalledWith([
+      { role: "user", content: "первый вопрос" },
+      { role: "assistant", content: "первый ответ" },
+      { role: "user", content: "третий вопрос" },
+      { role: "assistant", content: "третий ответ" },
+    ]);
   });
 
   it("reset clears history while keeping the agent configuration", async () => {
@@ -66,15 +83,164 @@ describe("Agent history", () => {
       { content: "первый ответ", totalTokens: 9 },
       { content: "ответ после сброса", totalTokens: 4 },
     ]);
-    const agent = new Agent({ client: fake.client, config: config({ model: "test-model" }) });
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client: fake.client, config: config({ model: "test-model" }), historyRepository });
 
     await agent.respond("первый вопрос");
     agent.reset();
+    expect(historyRepository.save).toHaveBeenLastCalledWith([]);
     const result = await agent.respond("новый вопрос");
 
     expect(fake.calls[1]!.model).toBe("test-model");
     expect(fake.calls[1]!.messages.map((message) => message.role)).toEqual(["system", "user"]);
     expect(result.usage.session.totalTokens).toBe(4);
+  });
+});
+
+describe("Agent history repository", () => {
+  const previousHistory: HistoryMessage[] = [
+    { role: "user", content: "прошлый вопрос" },
+    { role: "assistant", content: "прошлый ответ" },
+  ];
+
+  it("loads history once and saves completed pairs with usage starting at zero", async () => {
+    const fake = fakeClient([{ content: "  новый ответ\n", totalTokens: 4 }, { content: "ещё ответ" }]);
+    const historyRepository = fakeHistory(previousHistory);
+    const agent = new Agent({ client: fake.client, config: config(), historyRepository });
+
+    const result = await agent.respond("новый вопрос");
+
+    expect(fake.calls[0]!.messages).toEqual([
+      { role: "system", content: DEFAULT_AGENT_CONFIG.systemPrompt },
+      ...previousHistory,
+      { role: "user", content: "новый вопрос" },
+    ]);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
+      ...previousHistory,
+      { role: "user", content: "новый вопрос" },
+      { role: "assistant", content: "  новый ответ\n" },
+    ]);
+    expect(result.usage.session.totalTokens).toBe(4);
+
+    await agent.respond("ещё вопрос");
+    expect(historyRepository.load).toHaveBeenCalledOnce();
+  });
+
+  it("validates configuration before loading history and propagates load errors", () => {
+    const fake = fakeClient([]);
+    const historyRepository = fakeHistory();
+    const failure = new Error("История недоступна");
+    historyRepository.load.mockImplementation(() => {
+      throw failure;
+    });
+
+    expect(() => new Agent({ client: fake.client, config: config({ model: " " }), historyRepository })).toThrow(
+      AgentConfigError,
+    );
+    expect(historyRepository.load).not.toHaveBeenCalled();
+    expect(() => new Agent({ client: fake.client, config: config(), historyRepository })).toThrow(failure);
+    expect(historyRepository.save).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("detaches loaded messages and saved snapshots from the agent's history", async () => {
+    const loaded = structuredClone(previousHistory);
+    const fake = fakeClient([{ content: "первый ответ" }, { content: "второй ответ" }]);
+    const snapshots: Array<readonly HistoryMessage[]> = [];
+    const historyRepository: HistoryRepository = {
+      load: () => loaded,
+      save(messages) {
+        snapshots.push(messages);
+        messages[0]!.content = "изменено при сохранении";
+        messages.at(-1)!.content = "изменён ответ при сохранении";
+      },
+    };
+    const agent = new Agent({ client: fake.client, config: config(), historyRepository });
+
+    loaded[0]!.content = "изменено после загрузки";
+    loaded.pop();
+    await agent.respond("первый вопрос");
+    snapshots[0]![1]!.content = "изменено после сохранения";
+    await agent.respond("второй вопрос");
+
+    expect(fake.calls[1]!.messages.slice(1)).toEqual([
+      ...previousHistory,
+      { role: "user", content: "первый вопрос" },
+      { role: "assistant", content: "первый ответ" },
+      { role: "user", content: "второй вопрос" },
+    ]);
+    expect(snapshots[0]).toHaveLength(4);
+    expect(snapshots[1]).toHaveLength(6);
+    expect(snapshots[1]![1]!.content).toBe("прошлый ответ");
+  });
+
+  it("rejects a failed save without retrying the LLM or adding history, but keeps spent usage", async () => {
+    const fake = fakeClient([
+      { content: "несохранённый ответ", totalTokens: 7 },
+      { content: "успешный ответ", totalTokens: 3 },
+    ]);
+    const historyRepository = fakeHistory(previousHistory);
+    const failure = new Error("Нет места для истории");
+    historyRepository.save.mockImplementationOnce((messages) => {
+      messages[0]!.content = "изменено при неудачном сохранении";
+      throw failure;
+    });
+    const agent = new Agent({ client: fake.client, config: config(), historyRepository });
+
+    await expect(agent.respond("несохранённый вопрос")).rejects.toBe(failure);
+    expect(fake.calls).toHaveLength(1);
+    const result = await agent.respond("новый вопрос");
+
+    expect(fake.calls[1]!.messages.slice(1)).toEqual([...previousHistory, { role: "user", content: "новый вопрос" }]);
+    expect(historyRepository.save).toHaveBeenLastCalledWith([
+      ...previousHistory,
+      { role: "user", content: "новый вопрос" },
+      { role: "assistant", content: "успешный ответ" },
+    ]);
+    expect(result.usage.turn.totalTokens).toBe(3);
+    expect(result.usage.session.totalTokens).toBe(10);
+  });
+
+  it("preserves history and usage when saving a reset fails", async () => {
+    const fake = fakeClient([
+      { content: "первый ответ", totalTokens: 7 },
+      { content: "второй ответ", totalTokens: 3 },
+    ]);
+    const historyRepository = fakeHistory(previousHistory);
+    const agent = new Agent({ client: fake.client, config: config(), historyRepository });
+    await agent.respond("первый вопрос");
+    const failure = new Error("Не удалось сохранить пустую историю");
+    historyRepository.save.mockImplementationOnce(() => {
+      throw failure;
+    });
+
+    expect(() => agent.reset()).toThrow(failure);
+    expect(historyRepository.save).toHaveBeenLastCalledWith([]);
+    const result = await agent.respond("второй вопрос");
+
+    expect(fake.calls[1]!.messages.slice(1)).toEqual([
+      ...previousHistory,
+      { role: "user", content: "первый вопрос" },
+      { role: "assistant", content: "первый ответ" },
+      { role: "user", content: "второй вопрос" },
+    ]);
+    expect(result.usage.session.totalTokens).toBe(10);
+  });
+
+  it("rejects concurrent calls and reset until saving is complete", async () => {
+    const fake = fakeClient([{ content: "ответ" }]);
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client: fake.client, config: config(), historyRepository });
+    let concurrent: Promise<AgentResult> | undefined;
+    historyRepository.save.mockImplementationOnce(() => {
+      concurrent = agent.respond("параллельный вопрос");
+      expect(() => agent.reset()).toThrow(AgentBusyError);
+    });
+
+    await agent.respond("вопрос");
+    await expect(concurrent).rejects.toBeInstanceOf(AgentBusyError);
+    expect(fake.calls).toHaveLength(1);
+    expect(() => agent.reset()).not.toThrow();
   });
 });
 
@@ -173,8 +339,10 @@ describe("Agent request configuration", () => {
       { content: "следующий сгенерированный промпт", totalTokens: 2 },
       { content: "следующий ответ", totalTokens: 3 },
     ]);
+    const historyRepository = fakeHistory();
     const agent = new Agent({
       client: fake.client,
+      historyRepository,
       config: config({
         strategy: "meta",
         format: "markdown",
@@ -213,6 +381,12 @@ describe("Agent request configuration", () => {
       reasoningTokens: 4,
       totalTokens: 12,
     });
+    expect(historyRepository.save).toHaveBeenLastCalledWith([
+      { role: "user", content: "исходная задача" },
+      { role: "assistant", content: "итоговый ответ" },
+      { role: "user", content: "продолжение" },
+      { role: "assistant", content: "следующий ответ" },
+    ]);
   });
 
   it.each<{ name: string; failedReplies: Array<FakeReply | Error>; spentTokens: number }>([
@@ -240,9 +414,11 @@ describe("Agent request configuration", () => {
       { content: "новый промпт", totalTokens: 2 },
       { content: "успешный ответ", totalTokens: 3 },
     ]);
-    const agent = new Agent({ client: fake.client, config: config({ strategy: "meta" }) });
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client: fake.client, config: config({ strategy: "meta" }), historyRepository });
 
     await expect(agent.respond("незавершённый вопрос")).rejects.toThrow();
+    expect(historyRepository.save).not.toHaveBeenCalled();
     const result = await agent.respond("новый вопрос");
 
     const nextPreparation = fake.calls[failedReplies.length]!;
@@ -252,6 +428,10 @@ describe("Agent request configuration", () => {
     ]);
     expect(result.usage.turn.totalTokens).toBe(5);
     expect(result.usage.session.totalTokens).toBe(spentTokens + 5);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
+      { role: "user", content: "новый вопрос" },
+      { role: "assistant", content: "успешный ответ" },
+    ]);
   });
 });
 
@@ -295,7 +475,8 @@ describe("Agent results and state", () => {
 
   it("returns finish reason and format validation without exposing the SDK response", async () => {
     const fake = fakeClient([{ content: "обычный текст", finishReason: "length" }, { content: "следующий ответ" }]);
-    const agent = new Agent({ client: fake.client, config: config({ format: "markdown" }) });
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client: fake.client, config: config({ format: "markdown" }), historyRepository });
 
     const result = await agent.respond("вопрос");
 
@@ -305,6 +486,10 @@ describe("Agent results and state", () => {
       validation: { ok: false, reason: "нет заголовка Markdown" },
     });
     expect(result).not.toHaveProperty("choices");
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
+      { role: "user", content: "вопрос" },
+      { role: "assistant", content: "обычный текст" },
+    ]);
 
     await agent.respond("следующий вопрос");
     expect(fake.calls[1]!.messages).toContainEqual({ role: "assistant", content: "обычный текст" });
@@ -312,10 +497,12 @@ describe("Agent results and state", () => {
 
   it("rejects blank input before an API call", async () => {
     const fake = fakeClient([]);
-    const agent = new Agent({ client: fake.client, config: config() });
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client: fake.client, config: config(), historyRepository });
 
     await expect(agent.respond(" \n\t ")).rejects.toBeInstanceOf(AgentInputError);
     expect(fake.calls).toHaveLength(0);
+    expect(historyRepository.save).not.toHaveBeenCalled();
   });
 
   it.each([{ content: null }, { content: "" }, { content: "   " }, { noChoices: true }])(
@@ -325,13 +512,19 @@ describe("Agent results and state", () => {
         { ...emptyReply, finishReason: "length", totalTokens: 8 },
         { content: "следующий ответ", totalTokens: 3 },
       ]);
-      const agent = new Agent({ client: fake.client, config: config() });
+      const historyRepository = fakeHistory();
+      const agent = new Agent({ client: fake.client, config: config(), historyRepository });
 
       await expect(agent.respond("пустой ответ")).rejects.toBeInstanceOf(AgentResponseError);
+      expect(historyRepository.save).not.toHaveBeenCalled();
       const result = await agent.respond("следующий вопрос");
 
       expect(fake.calls[1]!.messages.map((message) => message.role)).toEqual(["system", "user"]);
       expect(result.usage.session.totalTokens).toBe(11);
+      expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
+        { role: "user", content: "следующий вопрос" },
+        { role: "assistant", content: "следующий ответ" },
+      ]);
     },
   );
 
@@ -347,15 +540,18 @@ describe("Agent results and state", () => {
         return pending;
       },
     };
-    const agent = new Agent({ client, config: config() });
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client, config: config(), historyRepository });
 
     const active = agent.respond("первый вопрос");
 
     await expect(agent.respond("второй вопрос")).rejects.toBeInstanceOf(AgentBusyError);
     expect(() => agent.reset()).toThrow(AgentBusyError);
+    expect(historyRepository.save).not.toHaveBeenCalled();
 
     finish!(completionResponse(params!, { content: "ответ" }));
     await expect(active).resolves.toMatchObject({ text: "ответ" });
+    expect(historyRepository.save).toHaveBeenCalledOnce();
   });
 });
 
