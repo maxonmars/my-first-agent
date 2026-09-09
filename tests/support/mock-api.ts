@@ -1,3 +1,5 @@
+import { deepStrictEqual } from "node:assert/strict";
+
 globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = input instanceof Request ? input.url : String(input);
   const method = input instanceof Request ? input.method : init?.method;
@@ -13,6 +15,22 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
   if (headers.get("authorization") !== "Bearer sk-test") throw new Error("Нет ожидаемого Bearer-токена.");
   if (request.model !== "mock-model") throw new Error(`Неожиданная модель: ${request.model}`);
 
+  let content = `Эхо: ${question}`;
+
+  if (question === "Как меня зовут?") {
+    deepStrictEqual(request.messages.slice(1), [
+      { role: "user", content: "Меня зовут Максим" },
+      { role: "assistant", content: "Эхо: Меня зовут Максим" },
+      { role: "user", content: "Как меня зовут?" },
+    ]);
+    content = "Вас зовут Максим.";
+  }
+
+  if (question === "Есть ли предыдущий контекст?") {
+    deepStrictEqual(request.messages.slice(1), [{ role: "user", content: "Есть ли предыдущий контекст?" }]);
+    content = "Предыдущих сообщений нет.";
+  }
+
   return new Response(
     JSON.stringify({
       id: "mock-completion",
@@ -24,7 +42,7 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
           index: 0,
           logprobs: null,
           finish_reason: "stop",
-          message: { role: "assistant", content: `Эхо: ${question}`, refusal: null },
+          message: { role: "assistant", content, refusal: null },
         },
       ],
       usage: {
@@ -37,5 +55,3 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 };
-
-export {};

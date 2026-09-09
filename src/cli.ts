@@ -43,8 +43,12 @@ async function runInteractive(agent: AgentPort, io: CliIo): Promise<number> {
     if (question.toLowerCase() === "/exit") break;
 
     if (question.toLowerCase() === "/reset") {
-      agent.reset();
-      io.output.write("Контекст и статистика агента очищены.\n");
+      try {
+        agent.reset();
+        io.output.write("Контекст и статистика агента очищены.\n");
+      } catch (error) {
+        io.error.write(`Не удалось сбросить контекст: ${messageOf(error)}\n`);
+      }
       continue;
     }
 

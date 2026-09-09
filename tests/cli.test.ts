@@ -120,6 +120,23 @@ describe("interactive CLI", () => {
     expect(streams.output()).toContain("ответ после сбоя");
   });
 
+  it("reports a reset error without claiming success and processes the next input", async () => {
+    const agent = fakeAgent([result("ответ после ошибки сброса")]);
+    agent.reset.mockImplementationOnce(() => {
+      throw new Error("Не удалось сохранить историю: EACCES.");
+    });
+    const streams = capture("/reset\nследующий вопрос\n/exit\n");
+
+    const code = await runCli(agent, [], streams.io);
+
+    expect(code).toBe(0);
+    expect(agent.reset).toHaveBeenCalledOnce();
+    expect(streams.error()).toBe("Не удалось сбросить контекст: Не удалось сохранить историю: EACCES.\n");
+    expect(streams.output()).not.toContain("Контекст и статистика агента очищены.");
+    expect(agent.respond).toHaveBeenCalledWith("следующий вопрос");
+    expect(streams.output()).toContain("ответ после ошибки сброса");
+  });
+
   it("prints non-Error failures safely", async () => {
     const agent = fakeAgent([]);
     agent.respond.mockRejectedValueOnce("неизвестный сбой");

@@ -1,4 +1,5 @@
 import { FORMATS, type FormatName, type ValidationResult } from "./formats.ts";
+import type { HistoryMessage, HistoryRepository } from "./history.ts";
 import type { DeepSeekParams, LlmClient, LlmCompletion } from "./llm-client.ts";
 import { META_INSTRUCTION, STRATEGIES, type StrategyName } from "./strategies.ts";
 
@@ -34,9 +35,8 @@ export interface AgentResult {
 export interface AgentOptions {
   client: LlmClient;
   config: AgentConfig;
+  historyRepository?: HistoryRepository;
 }
-
-type HistoryMessage = { role: "user"; content: string } | { role: "assistant"; content: string };
 
 interface CompletionResult {
   text: string;
@@ -52,7 +52,8 @@ export class AgentBusyError extends Error {}
 export class Agent {
   private readonly client: LlmClient;
   private readonly config: Readonly<AgentConfig>;
-  private history: HistoryMessage[] = [];
+  private readonly historyRepository: HistoryRepository | undefined;
+  private history: HistoryMessage[];
   private sessionUsage: TokenUsage = emptyUsage();
   private busy = false;
 
@@ -60,6 +61,8 @@ export class Agent {
     validateConfig(options.config);
     this.client = options.client;
     this.config = Object.freeze({ ...options.config });
+    this.historyRepository = options.historyRepository;
+    this.history = cloneHistory(this.historyRepository?.load() ?? []);
   }
 
   async respond(input: string): Promise<AgentResult> {
@@ -85,7 +88,14 @@ export class Agent {
       const text = requireAnswer(completion);
       const validation = FORMATS[this.config.format].validate(text);
 
-      this.history.push({ role: "user", content: question }, { role: "assistant", content: text });
+      const nextHistory: HistoryMessage[] = [
+        ...this.history,
+        { role: "user", content: question },
+        { role: "assistant", content: text },
+      ];
+
+      this.historyRepository?.save(cloneHistory(nextHistory));
+      this.history = nextHistory;
 
       return {
         text,
@@ -104,6 +114,7 @@ export class Agent {
   reset(): void {
     if (this.busy) throw new AgentBusyError("Нельзя сбросить агента во время обработки запроса.");
 
+    this.historyRepository?.save([]);
     this.history = [];
     this.sessionUsage = emptyUsage();
   }
@@ -164,6 +175,10 @@ export class Agent {
 
     return blocks.filter((block) => block.length > 0).join("\n\n");
   }
+}
+
+function cloneHistory(messages: readonly HistoryMessage[]): HistoryMessage[] {
+  return messages.map((message) => ({ ...message }));
 }
 
 function validateConfig(config: AgentConfig): void {
