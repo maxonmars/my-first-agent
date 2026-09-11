@@ -2,19 +2,43 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_AGENT_CONFIG, readConfig } from "../src/config.ts";
 
 const API_KEY_MESSAGE = "Нет DEEPSEEK_API_KEY. Скопируй .env.example в .env и впиши свой ключ.";
-const saved = { key: process.env.DEEPSEEK_API_KEY, model: process.env.DEEPSEEK_MODEL };
+const saved = {
+  key: process.env.DEEPSEEK_API_KEY,
+  model: process.env.DEEPSEEK_MODEL,
+  limit: process.env.AGENT_MAX_INPUT_TOKENS,
+};
 
 describe("readConfig", () => {
   beforeEach(() => {
     vi.spyOn(process, "loadEnvFile").mockImplementation(() => {});
     delete process.env.DEEPSEEK_API_KEY;
     delete process.env.DEEPSEEK_MODEL;
+    delete process.env.AGENT_MAX_INPUT_TOKENS;
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     restoreEnv("DEEPSEEK_API_KEY", saved.key);
     restoreEnv("DEEPSEEK_MODEL", saved.model);
+    restoreEnv("AGENT_MAX_INPUT_TOKENS", saved.limit);
+  });
+
+  it.each([undefined, "", "   "])("disables the input budget for %s", (value) => {
+    process.env.DEEPSEEK_API_KEY = "sk-test";
+    if (value !== undefined) process.env.AGENT_MAX_INPUT_TOKENS = value;
+    expect(readConfig().agent.maxInputTokens).toBeNull();
+  });
+
+  it.each([" 2000 ", "1", String(Number.MAX_SAFE_INTEGER)])("reads input budget %s", (value) => {
+    process.env.DEEPSEEK_API_KEY = "sk-test";
+    process.env.AGENT_MAX_INPUT_TOKENS = value;
+    expect(readConfig().agent.maxInputTokens).toBe(Number(value));
+  });
+
+  it.each(["0", "-1", "1.5", "NaN", "Infinity", "abc", "9007199254740992"])("rejects input budget %s", (value) => {
+    process.env.DEEPSEEK_API_KEY = "sk-test";
+    process.env.AGENT_MAX_INPUT_TOKENS = value;
+    expect(() => readConfig()).toThrow("AGENT_MAX_INPUT_TOKENS должен быть положительным безопасным целым числом");
   });
 
   it("explains how to configure a missing or empty key", () => {
@@ -68,7 +92,10 @@ describe("readConfig", () => {
   });
 });
 
-function restoreEnv(name: "DEEPSEEK_API_KEY" | "DEEPSEEK_MODEL", value: string | undefined): void {
+function restoreEnv(
+  name: "DEEPSEEK_API_KEY" | "DEEPSEEK_MODEL" | "AGENT_MAX_INPUT_TOKENS",
+  value: string | undefined,
+): void {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
 }

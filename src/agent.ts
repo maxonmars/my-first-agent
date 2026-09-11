@@ -2,6 +2,7 @@ import { FORMATS, type FormatName, type ValidationResult } from "./formats.ts";
 import type { HistoryMessage, HistoryRepository } from "./history.ts";
 import type { DeepSeekParams, LlmClient, LlmCompletion } from "./llm-client.ts";
 import { META_INSTRUCTION, STRATEGIES, type StrategyName } from "./strategies.ts";
+import { estimateContextTokens, estimateTextTokens } from "./tokens.ts";
 
 export interface AgentConfig {
   model: string;
@@ -10,6 +11,7 @@ export interface AgentConfig {
   format: FormatName;
   maxWords: number | null;
   maxTokens: number | null;
+  maxInputTokens: number | null;
   stopMarker: string | null;
   temperature: number | null;
   thinkingEnabled: boolean;
@@ -26,7 +28,12 @@ export interface AgentResult {
   text: string;
   finishReason: string;
   validation: ValidationResult;
+  tokenEstimate: {
+    questionTokens: number;
+    contextTokens: number;
+  };
   usage: {
+    finalCall: TokenUsage;
     turn: TokenUsage;
     session: TokenUsage;
   };
@@ -38,7 +45,12 @@ export interface AgentOptions {
   historyRepository?: HistoryRepository;
 }
 
+type PreparedParams = DeepSeekParams & {
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+};
+
 interface CompletionResult {
+  contextTokens: number;
   text: string;
   finishReason: string;
   usage: TokenUsage;
@@ -48,6 +60,7 @@ export class AgentConfigError extends Error {}
 export class AgentInputError extends Error {}
 export class AgentResponseError extends Error {}
 export class AgentBusyError extends Error {}
+export class AgentContextLimitError extends Error {}
 
 export class Agent {
   private readonly client: LlmClient;
@@ -101,7 +114,12 @@ export class Agent {
         text,
         finishReason: completion.finishReason,
         validation,
+        tokenEstimate: {
+          questionTokens: estimateTextTokens(question),
+          contextTokens: completion.contextTokens,
+        },
         usage: {
+          finalCall: cloneUsage(completion.usage),
           turn: cloneUsage(turnUsage),
           session: cloneUsage(this.sessionUsage),
         },
@@ -124,7 +142,17 @@ export class Agent {
     extraInstruction: string,
     applyOutputPolicy: boolean,
   ): Promise<CompletionResult> {
-    const response = await this.client.create(this.buildParams(question, extraInstruction, applyOutputPolicy));
+    const params = this.buildParams(question, extraInstruction, applyOutputPolicy);
+    const contextTokens = estimateContextTokens(params.messages);
+
+    if (this.config.maxInputTokens !== null && contextTokens > this.config.maxInputTokens) {
+      throw new AgentContextLimitError(
+        `Оценка входного контекста ≈ ${contextTokens} токенов превышает установленный лимит ${this.config.maxInputTokens}. ` +
+          "Сократите вопрос или очистите историю командой /reset.",
+      );
+    }
+
+    const response = await this.client.create(params);
     const usage = usageOf(response);
 
     this.sessionUsage = addUsage(this.sessionUsage, usage);
@@ -132,14 +160,15 @@ export class Agent {
     const choice = response.choices[0];
 
     return {
+      contextTokens,
       text: choice?.message.content ?? "",
       finishReason: choice?.finish_reason ?? "unknown",
       usage,
     };
   }
 
-  private buildParams(question: string, extraInstruction: string, applyOutputPolicy: boolean): DeepSeekParams {
-    const params: DeepSeekParams = {
+  private buildParams(question: string, extraInstruction: string, applyOutputPolicy: boolean): PreparedParams {
+    const params: PreparedParams = {
       model: this.config.model,
       messages: [
         { role: "system", content: this.buildSystemPrompt(extraInstruction, applyOutputPolicy) },
@@ -192,6 +221,9 @@ function validateConfig(config: AgentConfig): void {
   if (!Object.hasOwn(FORMATS, config.format)) throw new AgentConfigError(`Неизвестный формат: ${config.format}.`);
   assertPositiveInteger(config.maxWords, "maxWords");
   assertPositiveInteger(config.maxTokens, "maxTokens");
+  if (config.maxInputTokens !== null && (!Number.isSafeInteger(config.maxInputTokens) || config.maxInputTokens <= 0)) {
+    throw new AgentConfigError("maxInputTokens должен быть положительным безопасным целым числом.");
+  }
 
   if (
     config.temperature !== null &&

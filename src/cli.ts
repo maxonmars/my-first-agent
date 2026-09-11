@@ -64,13 +64,21 @@ async function runInteractive(agent: AgentPort, io: CliIo): Promise<number> {
 }
 
 function writeResult(output: Writable, result: AgentResult): void {
-  const { turn, session } = result.usage;
+  const { finalCall, turn, session } = result.usage;
 
   output.write(`${result.text}\n`);
   output.write(
-    `— токены: вход ${turn.promptTokens}, генерация ${turn.completionTokens} ` +
-      `(из них рассуждение ${turn.reasoningTokens}), ход ${turn.totalTokens}, сессия ${session.totalTokens}\n`,
+    `— оценка токенов: новый вопрос ≈ ${result.tokenEstimate.questionTokens}, весь стек ≈ ${result.tokenEstimate.contextTokens}\n`,
   );
+  output.write(
+    `— API, финальный вызов: вход ${finalCall.promptTokens}, генерация ${finalCall.completionTokens} ` +
+      `(из них рассуждение ${finalCall.reasoningTokens})\n`,
+  );
+  output.write(`— расход токенов: ход ${turn.totalTokens}, сессия ${session.totalTokens}\n`);
+
+  if (result.finishReason === "length") {
+    output.write("— генерация остановилась по лимиту длины; ответ может быть неполным.\n");
+  }
 
   if (!result.validation.ok)
     output.write(`— формат не выдержан: ${result.validation.reason ?? "неизвестная причина"}\n`);

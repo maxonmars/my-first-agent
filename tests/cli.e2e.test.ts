@@ -28,7 +28,7 @@ function runProcess(args: string[], input?: string, env = process.env) {
 }
 
 function mockEnvironment(): NodeJS.ProcessEnv {
-  return { ...process.env, DEEPSEEK_API_KEY: "sk-test", DEEPSEEK_MODEL: "mock-model" };
+  return { ...process.env, DEEPSEEK_API_KEY: "sk-test", DEEPSEEK_MODEL: "mock-model", AGENT_MAX_INPUT_TOKENS: "" };
 }
 
 function readHistory(): unknown {
@@ -115,4 +115,26 @@ describe("CLI process", () => {
     expect(result.stderr).not.toContain(" at ");
     expect(readFileSync(historyPath, "utf8")).toBe(corrupted);
   });
+});
+
+it("blocks growing history locally and recovers through interactive reset", () => {
+  const env = { ...mockEnvironment(), AGENT_MAX_INPUT_TOKENS: "17" };
+  const result = runProcess([], "abcd\nabcd\nabcd\n/reset\nabcd\n/exit\n", env);
+  expect(result.status).toBe(0);
+  expect(result.stdout.match(/Эхо: abcd/g)).toHaveLength(3);
+  expect(result.stdout.match(/новый вопрос ≈ 1, весь стек ≈ 13/g)).toHaveLength(2);
+  expect(result.stdout).toContain("новый вопрос ≈ 1, весь стек ≈ 17");
+  expect(result.stderr).toContain("≈ 21 токенов превышает установленный лимит 17");
+  expect(result.stdout).toContain("ход 8, сессия 16");
+  expect(result.stdout.split("Контекст и статистика агента очищены.")[1]).toContain("ход 8, сессия 8");
+  expect(readHistory()).toEqual([
+    { role: "user", content: "abcd" },
+    { role: "assistant", content: "Эхо: abcd" },
+  ]);
+  const beforeRefusal = readFileSync(historyPath, "utf8");
+  const blocked = runProcess(["x".repeat(100)], undefined, env);
+  expect(blocked.status).toBe(1);
+  expect(blocked.stdout).toBe("");
+  expect(blocked.stderr).toContain("превышает установленный лимит 17");
+  expect(readFileSync(historyPath, "utf8")).toBe(beforeRefusal);
 });

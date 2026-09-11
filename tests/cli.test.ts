@@ -11,7 +11,9 @@ function result(text: string, options: { valid?: boolean; total?: number } = {})
     text,
     finishReason: "stop",
     validation: options.valid === false ? { ok: false, reason: "нарушен контракт" } : { ok: true },
+    tokenEstimate: { questionTokens: 2, contextTokens: 30 },
     usage: {
+      finalCall: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: 7 },
       turn: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: total },
       session: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: total },
     },
@@ -72,6 +74,9 @@ describe("one-shot CLI", () => {
     expect(agent.respond).toHaveBeenCalledWith("сложный вопрос");
     expect(streams.output()).toContain("готовый ответ");
     expect(streams.output()).toContain("ход 9, сессия 9");
+    expect(streams.output()).toContain("новый вопрос ≈ 2, весь стек ≈ 30");
+    expect(streams.output()).toContain("финальный вызов: вход 4, генерация 3 (из них рассуждение 2)");
+    expect(streams.output()).not.toContain("ответ может быть неполным");
     expect(streams.error()).toBe("");
   });
 
@@ -146,4 +151,13 @@ describe("interactive CLI", () => {
 
     expect(streams.error()).toContain("Запрос не удался: неизвестный сбой");
   });
+});
+
+it("warns about length without reporting input overflow", async () => {
+  const reply = result("частичный ответ");
+  reply.finishReason = "length";
+  const streams = capture();
+  expect(await runCli(fakeAgent([reply]), ["вопрос"], streams.io)).toBe(0);
+  expect(streams.output()).toContain("генерация остановилась по лимиту длины; ответ может быть неполным");
+  expect(streams.error()).toBe("");
 });
