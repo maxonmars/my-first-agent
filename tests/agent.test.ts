@@ -4,6 +4,7 @@ import {
   AgentBusyError,
   type AgentConfig,
   AgentConfigError,
+  AgentContextLimitError,
   AgentInputError,
   AgentResponseError,
   type AgentResult,
@@ -375,6 +376,15 @@ describe("Agent request configuration", () => {
     });
     expect(fake.calls[2]!.messages).toContainEqual({ role: "assistant", content: "итоговый ответ" });
     expect(fake.calls[2]!.messages).not.toContainEqual({ role: "assistant", content: "сгенерированный промпт" });
+    expect(result.tokenEstimate.contextTokens).toBe(
+      fake.calls[1]!.messages.reduce((sum, message) => sum + Math.ceil((message.content as string).length / 4), 0),
+    );
+    expect(result.usage.finalCall).toEqual({
+      promptTokens: 4,
+      completionTokens: 5,
+      reasoningTokens: 3,
+      totalTokens: 9,
+    });
     expect(result.usage.turn).toEqual({
       promptTokens: 5,
       completionTokens: 7,
@@ -445,17 +455,25 @@ describe("Agent results and state", () => {
 
     const first = await agent.respond("раз");
     first.usage.session.totalTokens = 999;
+    first.usage.finalCall.totalTokens = 998;
+    first.usage.turn.totalTokens = 997;
+    first.tokenEstimate.questionTokens = 996;
+    first.tokenEstimate.contextTokens = 995;
     const second = await agent.respond("два");
 
     expect(first.usage).toEqual({
-      turn: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 14 },
+      finalCall: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 998 },
+      turn: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 997 },
       session: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 999 },
     });
     expect(second.usage).toEqual({
+      finalCall: { promptTokens: 20, completionTokens: 6, reasoningTokens: 3, totalTokens: 26 },
       turn: { promptTokens: 20, completionTokens: 6, reasoningTokens: 3, totalTokens: 26 },
       session: { promptTokens: 30, completionTokens: 10, reasoningTokens: 5, totalTokens: 40 },
     });
     expect(second.usage.session.totalTokens).toBe(40);
+    expect(second.tokenEstimate.questionTokens).toBe(1);
+    expect(second.tokenEstimate.contextTokens).toBe(15);
   });
 
   it("derives total usage and returns zeros when the API omits usage", async () => {
@@ -581,4 +599,158 @@ describe("Agent configuration validation", () => {
       () => new Agent({ client: fake.client, config: { ...config(), format: "xml" } as unknown as AgentConfig }),
     ).toThrow(AgentConfigError);
   });
+});
+
+describe("Agent token estimates and input budget", () => {
+  it("measures trimmed questions and the actual stack including policies and loaded history", async () => {
+    const historyRepository = fakeHistory([
+      { role: "user", content: "старый вопрос" },
+      { role: "assistant", content: "старый ответ" },
+    ]);
+    const fake = fakeClient([
+      { content: "# Ответ", noUsage: true },
+      { content: "# Ещё", totalTokens: 7 },
+    ]);
+    const agent = new Agent({
+      client: fake.client,
+      historyRepository,
+      config: config({ strategy: "steps", format: "markdown", maxWords: 20, stopMarker: "<END>" }),
+    });
+    const first = await agent.respond("  вопрос \n");
+    const second = await agent.respond("вопрос");
+    const stack = fake.calls[0]!.messages;
+    expect(first.tokenEstimate.questionTokens).toBe(2);
+    expect(first.tokenEstimate.contextTokens).toBe(
+      stack.reduce((sum, message) => sum + Math.ceil((message.content as string).length / 4), 0),
+    );
+    expect(systemOf(fake.calls[0]!)).toContain("пошагово");
+    expect(systemOf(fake.calls[0]!)).toContain("Markdown");
+    expect(systemOf(fake.calls[0]!)).toContain("Уложись в 20 слов.");
+    expect(systemOf(fake.calls[0]!)).toContain("<END>");
+    expect(stack.slice(1, 3)).toEqual(historyRepository.load.mock.results[0]!.value);
+    expect(first.usage.session.totalTokens).toBe(0);
+    expect(first.usage.finalCall.totalTokens).toBe(0);
+    expect(second.tokenEstimate.questionTokens).toBe(2);
+    expect(second.tokenEstimate.contextTokens).toBe(first.tokenEstimate.contextTokens + 4);
+    first.tokenEstimate.contextTokens = 999;
+    first.usage.finalCall.totalTokens = 999;
+    first.usage.turn.totalTokens = 999;
+    expect(first.usage.session.totalTokens).toBe(0);
+    expect(second.usage.session.totalTokens).toBe(7);
+  });
+
+  it.each([null, 2, 3])("allows disabled, equal or larger budget %s", async (maxInputTokens) => {
+    const fake = fakeClient([{}]);
+    const agent = new Agent({ client: fake.client, config: config({ systemPrompt: "abcd", maxInputTokens }) });
+    const result = await agent.respond("abcd");
+    expect(result.tokenEstimate).toEqual({ questionTokens: 1, contextTokens: 2 });
+    expect(result.usage.finalCall).toEqual(result.usage.turn);
+    expect(result.usage.finalCall).not.toBe(result.usage.turn);
+    expect(result.usage.turn).not.toBe(result.usage.session);
+    expect(fake.calls[0]).not.toHaveProperty("maxInputTokens");
+    expect(fake.calls[0]).not.toHaveProperty("max_input_tokens");
+  });
+
+  it("compares short, long and overflowing dialogs, then restores capacity on reset", async () => {
+    // Usage здесь — фиксированные тестовые данные, не измерения DeepSeek.
+    const fake = fakeClient(
+      Array.from({ length: 9 }, () => ({ content: "abcd", promptTokens: 5, completionTokens: 3 })),
+    );
+    const historyRepository = fakeHistory();
+    const agent = new Agent({
+      client: fake.client,
+      historyRepository,
+      config: config({ systemPrompt: "abcd", maxInputTokens: 16 }),
+    });
+    const estimates: number[] = [];
+    for (let index = 0; index < 8; index += 1) {
+      const result = await agent.respond("abcd");
+      expect(result.tokenEstimate.questionTokens).toBe(1);
+      estimates.push(result.tokenEstimate.contextTokens);
+      expect(result.usage.session.totalTokens).toBe((index + 1) * 8);
+      expect(fake.calls[index]!.messages.slice(1, -1)).toEqual(
+        Array.from({ length: index }, () => [
+          { role: "user", content: "abcd" },
+          { role: "assistant", content: "abcd" },
+        ]).flat(),
+      );
+    }
+    expect(estimates).toEqual([2, 4, 6, 8, 10, 12, 14, 16]);
+    await expect(agent.respond("abcd")).rejects.toThrow(AgentContextLimitError);
+    expect(fake.calls).toHaveLength(8);
+    expect(historyRepository.save).toHaveBeenCalledTimes(8);
+    historyRepository.save.mockImplementationOnce(() => {
+      throw new Error("reset save failed");
+    });
+    expect(() => agent.reset()).toThrow("reset save failed");
+    await expect(agent.respond("abcd")).rejects.toThrow("≈ 18 токенов превышает установленный лимит 16");
+    agent.reset();
+    const restored = await agent.respond("abcd");
+    expect(restored.tokenEstimate.contextTokens).toBe(2);
+    expect(restored.usage.session.totalTokens).toBe(8);
+    expect(fake.calls).toHaveLength(9);
+    expect(historyRepository.save).toHaveBeenLastCalledWith([
+      { role: "user", content: "abcd" },
+      { role: "assistant", content: "abcd" },
+    ]);
+    await expect(agent.respond("x".repeat(100))).rejects.toThrow(AgentContextLimitError);
+  });
+
+  it("allows a shorter question after refusal without spending usage or saving the rejected turn", async () => {
+    const fake = fakeClient([{ content: "ok", totalTokens: 5 }]);
+    const historyRepository = fakeHistory();
+    const agent = new Agent({
+      client: fake.client,
+      historyRepository,
+      config: config({ systemPrompt: "abcd", maxInputTokens: 2 }),
+    });
+    await expect(agent.respond("secret question")).rejects.toThrow(
+      "Оценка входного контекста ≈ 5 токенов превышает установленный лимит 2. Сократите вопрос или очистите историю командой /reset.",
+    );
+    expect(fake.calls).toHaveLength(0);
+    expect(historyRepository.save).not.toHaveBeenCalled();
+    const result = await agent.respond("abcd");
+    expect(result.usage.session.totalTokens).toBe(5);
+    expect(fake.calls[0]!.messages).toHaveLength(2);
+  });
+
+  it("checks both meta calls and retains preparation usage when its instruction exceeds the final budget", async () => {
+    const fake = fakeClient([
+      { content: "x".repeat(2000), totalTokens: 7 },
+      { content: "кратко", totalTokens: 2 },
+      { content: "ответ", totalTokens: 3 },
+    ]);
+    const historyRepository = fakeHistory();
+    const agent = new Agent({
+      client: fake.client,
+      historyRepository,
+      config: config({ strategy: "meta", maxInputTokens: 300 }),
+    });
+    await expect(agent.respond("x".repeat(2000))).rejects.toThrow(AgentContextLimitError);
+    expect(fake.calls).toHaveLength(0);
+    await expect(agent.respond("вопрос")).rejects.toThrow(AgentContextLimitError);
+    expect(fake.calls).toHaveLength(1);
+    expect(historyRepository.save).not.toHaveBeenCalled();
+    const result = await agent.respond("новый вопрос");
+    expect(result.usage.finalCall.totalTokens).toBe(3);
+    expect(result.usage.turn.totalTokens).toBe(5);
+    expect(result.usage.session.totalTokens).toBe(12);
+    expect(fake.calls[1]!.messages).toHaveLength(2);
+    expect(fake.calls[2]!.messages).toHaveLength(2);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
+      { role: "user", content: "новый вопрос" },
+      { role: "assistant", content: "ответ" },
+    ]);
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects unsafe or nonpositive direct budget %s before loading history",
+    (maxInputTokens) => {
+      const historyRepository = fakeHistory();
+      expect(
+        () => new Agent({ client: fakeClient([]).client, historyRepository, config: config({ maxInputTokens }) }),
+      ).toThrow(AgentConfigError);
+      expect(historyRepository.load).not.toHaveBeenCalled();
+    },
+  );
 });
