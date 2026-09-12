@@ -13,6 +13,7 @@ function result(text: string, options: { valid?: boolean; total?: number } = {})
     validation: options.valid === false ? { ok: false, reason: "нарушен контракт" } : { ok: true },
     tokenEstimate: { questionTokens: 2, contextTokens: 30 },
     usage: {
+      summaryCall: null,
       finalCall: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: 7 },
       turn: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: total },
       session: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: total },
@@ -160,4 +161,12 @@ it("warns about length without reporting input overflow", async () => {
   expect(await runCli(fakeAgent([reply]), ["вопрос"], streams.io)).toBe(0);
   expect(streams.output()).toContain("генерация остановилась по лимиту длины; ответ может быть неполным");
   expect(streams.error()).toBe("");
+});
+
+it("prints provider summary usage separately from estimates", async () => {
+  const response = result("answer");
+  response.usage.summaryCall = { promptTokens: 12, completionTokens: 3, reasoningTokens: 0, totalTokens: 15 };
+  const streams = capture();
+  expect(await runCli(fakeAgent([response]), ["question"], streams.io)).toBe(0);
+  expect(streams.output()).toContain("API, summary: вход 12, генерация 3, всего 15");
 });

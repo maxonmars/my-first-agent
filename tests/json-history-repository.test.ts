@@ -48,15 +48,15 @@ describe("JSON history repository", () => {
   });
 
   it("returns an empty history when the file does not exist", () => {
-    expect(repository.load()).toEqual([]);
+    expect(repository.load()).toEqual({ summary: null, messages: [] });
     expect(readdirSync(directory)).toEqual([]);
   });
 
   it("saves UTF-8 JSON with indentation and reloads Unicode and whitespace unchanged", () => {
-    repository.save(originalHistory);
+    repository.save({ summary: null, messages: originalHistory });
 
-    expect(readFileSync(filePath, "utf8")).toBe(JSON.stringify(originalHistory, null, 2));
-    expect(new JsonHistoryRepository(filePath).load()).toEqual(originalHistory);
+    expect(readFileSync(filePath, "utf8")).toBe(JSON.stringify({ summary: null, messages: originalHistory }, null, 2));
+    expect(new JsonHistoryRepository(filePath).load()).toEqual({ summary: null, messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
     const [temporaryPath, destination] = vi.mocked(renameSync).mock.calls[0];
     expect(temporaryPath).toMatch(new RegExp(`^${filePath.replaceAll(".", "\\.")}\\.[0-9a-f-]{36}\\.tmp$`));
@@ -64,15 +64,43 @@ describe("JSON history repository", () => {
     expect(vi.mocked(writeFileSync).mock.calls[0][0]).toBe(temporaryPath);
   });
 
-  it("replaces previous history and persists an empty array without deleting the file", () => {
-    repository.save(originalHistory);
-    repository.save(nextHistory);
-    expect(repository.load()).toEqual(nextHistory);
+  it("replaces previous history and persists an empty state without deleting the file", () => {
+    repository.save({ summary: null, messages: originalHistory });
+    repository.save({ summary: null, messages: nextHistory });
+    expect(repository.load()).toEqual({ summary: null, messages: nextHistory });
 
-    repository.save([]);
-    expect(readFileSync(filePath, "utf8")).toBe("[]");
-    expect(repository.load()).toEqual([]);
+    repository.save({ summary: null, messages: [] });
+    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual({ summary: null, messages: [] });
+    expect(repository.load()).toEqual({ summary: null, messages: [] });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
+  });
+
+  it("reads a legacy array without rewriting it and writes the object on the next save", () => {
+    const source = JSON.stringify(originalHistory);
+    writeFileSync(filePath, source);
+    const state = repository.load();
+    expect(state).toEqual({ summary: null, messages: originalHistory });
+    expect(readFileSync(filePath, "utf8")).toBe(source);
+    repository.save(state);
+    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual(state);
+  });
+
+  it("restores summary and tail unchanged", () => {
+    const state = { summary: "  Факт: код 007.\n", messages: originalHistory };
+    repository.save(state);
+    expect(new JsonHistoryRepository(filePath).load()).toEqual(state);
+  });
+
+  it.each(["", " \n", 42, undefined])("rejects invalid summary %s without rewriting", (summary) => {
+    const source = JSON.stringify({ summary, messages: originalHistory });
+    writeFileSync(filePath, source);
+    expect(() => repository.load()).toThrow("неверная структура");
+    expect(readFileSync(filePath, "utf8")).toBe(source);
+  });
+
+  it("checks pairs in the new format", () => {
+    writeFileSync(filePath, JSON.stringify({ summary: "summary", messages: [originalHistory[0]] }));
+    expect(() => repository.load()).toThrow("нарушен порядок пар");
   });
 
   it("rejects malformed JSON without exposing content or changing the file", () => {
@@ -100,7 +128,7 @@ describe("JSON history repository", () => {
     writeFileSync(filePath, source, "utf8");
 
     expect(() => repository.load()).toThrow(
-      `Не удалось загрузить историю из «${filePath}»: неверная структура сообщений.`,
+      `Не удалось загрузить историю из «${filePath}»: неверная структура истории.`,
     );
     expect(readFileSync(filePath, "utf8")).toBe(source);
   });
@@ -132,7 +160,7 @@ describe("JSON history repository", () => {
   });
 
   it("reports EACCES without exposing the original error or changing the history", () => {
-    repository.save(originalHistory);
+    repository.save({ summary: null, messages: originalHistory });
     vi.mocked(readFileSync).mockImplementationOnce(() => {
       throw fileError("EACCES");
     });
@@ -140,7 +168,7 @@ describe("JSON history repository", () => {
     expect(() => repository.load()).toThrow(
       `Не удалось загрузить историю из «${filePath}»: ошибка чтения файла (EACCES).`,
     );
-    expect(repository.load()).toEqual(originalHistory);
+    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
   });
 
   it.each([
@@ -157,41 +185,41 @@ describe("JSON history repository", () => {
   });
 
   it("keeps the old file and removes the partial temporary file when writing fails", () => {
-    repository.save(originalHistory);
+    repository.save({ summary: null, messages: originalHistory });
     const previousSource = readFileSync(filePath, "utf8");
     vi.mocked(writeFileSync).mockImplementationOnce((path) => {
       realFs.writeFileSync(path, "partial write", "utf8");
       throw fileError("ENOSPC");
     });
 
-    expect(() => repository.save(nextHistory)).toThrow(
+    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка записи временного файла (ENOSPC).`,
     );
     expect(readFileSync(filePath, "utf8")).toBe(previousSource);
-    expect(repository.load()).toEqual(originalHistory);
+    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
   });
 
   it("keeps the old file and cleans up the temporary file when replacement fails", () => {
-    repository.save(originalHistory);
+    repository.save({ summary: null, messages: originalHistory });
     const previousSource = readFileSync(filePath, "utf8");
     vi.mocked(renameSync).mockImplementationOnce(() => {
       throw fileError("EACCES");
     });
 
-    expect(() => repository.save(nextHistory)).toThrow(
+    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка замены файла (EACCES).`,
     );
     expect(readFileSync(filePath, "utf8")).toBe(previousSource);
-    expect(repository.load()).toEqual(originalHistory);
+    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
 
-    repository.save(nextHistory);
-    expect(repository.load()).toEqual(nextHistory);
+    repository.save({ summary: null, messages: nextHistory });
+    expect(repository.load()).toEqual({ summary: null, messages: nextHistory });
   });
 
   it("preserves the replacement error when temporary file cleanup also fails", () => {
-    repository.save(originalHistory);
+    repository.save({ summary: null, messages: originalHistory });
     vi.mocked(renameSync).mockImplementationOnce(() => {
       throw fileError("EACCES");
     });
@@ -199,23 +227,23 @@ describe("JSON history repository", () => {
       throw fileError("EPERM");
     });
 
-    expect(() => repository.save(nextHistory)).toThrow(
+    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка замены файла (EACCES).`,
     );
-    expect(repository.load()).toEqual(originalHistory);
+    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
     expect(readdirSync(directory)).toHaveLength(2);
   });
 
   it("reports the original write error when no temporary file was created", () => {
-    repository.save(originalHistory);
+    repository.save({ summary: null, messages: originalHistory });
     vi.mocked(writeFileSync).mockImplementationOnce(() => {
       throw new Error("секрет диалога");
     });
 
-    expect(() => repository.save(nextHistory)).toThrow(
+    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка записи временного файла.`,
     );
-    expect(repository.load()).toEqual(originalHistory);
+    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
   });
 });

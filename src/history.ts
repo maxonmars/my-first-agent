@@ -1,6 +1,11 @@
 export type HistoryMessage = { role: "user"; content: string } | { role: "assistant"; content: string };
 
+export interface HistoryState {
+  summary: string | null;
+  messages: HistoryMessage[];
+}
+
 export interface HistoryRepository {
-  load(): HistoryMessage[];
-  save(messages: readonly HistoryMessage[]): void;
+  load(): HistoryState;
+  save(state: HistoryState): void;
 }

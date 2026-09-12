@@ -17,6 +17,31 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
 
   let content = `Эхо: ${question}`;
 
+  if (request.messages[0]?.content.startsWith("Кратко обнови summary")) {
+    const source = JSON.parse(question);
+    deepStrictEqual(source.summary, null);
+    deepStrictEqual(
+      source.messages,
+      Array.from({ length: 5 }, (_, i) => [
+        { role: "user", content: `ход ${i + 1}` },
+        { role: "assistant", content: `Эхо: ход ${i + 1}` },
+      ]).flat(),
+    );
+    content = "Факт из первых пяти ходов.";
+  }
+  if (question === "Проверь восстановленное summary") {
+    deepStrictEqual(request.messages[1]?.role, "user");
+    if (!request.messages[1]?.content.includes("Факт из первых пяти ходов.")) throw new Error("Нет summary");
+    deepStrictEqual(
+      request.messages.slice(2, -1),
+      Array.from({ length: 6 }, (_, i) => [
+        { role: "user", content: `ход ${i + 6}` },
+        { role: "assistant", content: `Эхо: ход ${i + 6}` },
+      ]).flat(),
+    );
+    content = "Summary и хвост восстановлены.";
+  }
+
   if (question === "Как меня зовут?") {
     deepStrictEqual(request.messages.slice(1), [
       { role: "user", content: "Меня зовут Максим" },

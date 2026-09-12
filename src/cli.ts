@@ -64,7 +64,7 @@ async function runInteractive(agent: AgentPort, io: CliIo): Promise<number> {
 }
 
 function writeResult(output: Writable, result: AgentResult): void {
-  const { finalCall, turn, session } = result.usage;
+  const { summaryCall, finalCall, turn, session } = result.usage;
 
   output.write(`${result.text}\n`);
   output.write(
@@ -74,6 +74,11 @@ function writeResult(output: Writable, result: AgentResult): void {
     `— API, финальный вызов: вход ${finalCall.promptTokens}, генерация ${finalCall.completionTokens} ` +
       `(из них рассуждение ${finalCall.reasoningTokens})\n`,
   );
+  if (summaryCall !== null) {
+    output.write(
+      `— API, summary: вход ${summaryCall.promptTokens}, генерация ${summaryCall.completionTokens}, всего ${summaryCall.totalTokens}\n`,
+    );
+  }
   output.write(`— расход токенов: ход ${turn.totalTokens}, сессия ${session.totalTokens}\n`);
 
   if (result.finishReason === "length") {

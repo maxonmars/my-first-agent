@@ -20,7 +20,7 @@ function config(overrides: Partial<AgentConfig> = {}): AgentConfig {
 
 function fakeHistory(messages: HistoryMessage[] = []) {
   return {
-    load: vi.fn<HistoryRepository["load"]>(() => messages),
+    load: vi.fn<HistoryRepository["load"]>(() => ({ summary: null, messages })),
     save: vi.fn<HistoryRepository["save"]>(),
   };
 }
@@ -71,12 +71,15 @@ describe("Agent history", () => {
     expect(fake.calls[2]!.messages.map((message) => message.role)).toEqual(["system", "user", "assistant", "user"]);
     expect(fake.calls[2]!.messages).not.toContainEqual({ role: "user", content: "сломанный вопрос" });
     expect(result.usage.session.totalTokens).toBe(8);
-    expect(historyRepository.save).toHaveBeenLastCalledWith([
-      { role: "user", content: "первый вопрос" },
-      { role: "assistant", content: "первый ответ" },
-      { role: "user", content: "третий вопрос" },
-      { role: "assistant", content: "третий ответ" },
-    ]);
+    expect(historyRepository.save).toHaveBeenLastCalledWith({
+      summary: null,
+      messages: [
+        { role: "user", content: "первый вопрос" },
+        { role: "assistant", content: "первый ответ" },
+        { role: "user", content: "третий вопрос" },
+        { role: "assistant", content: "третий ответ" },
+      ],
+    });
   });
 
   it("reset clears history while keeping the agent configuration", async () => {
@@ -89,7 +92,7 @@ describe("Agent history", () => {
 
     await agent.respond("первый вопрос");
     agent.reset();
-    expect(historyRepository.save).toHaveBeenLastCalledWith([]);
+    expect(historyRepository.save).toHaveBeenLastCalledWith({ summary: null, messages: [] });
     const result = await agent.respond("новый вопрос");
 
     expect(fake.calls[1]!.model).toBe("test-model");
@@ -116,11 +119,14 @@ describe("Agent history repository", () => {
       ...previousHistory,
       { role: "user", content: "новый вопрос" },
     ]);
-    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
-      ...previousHistory,
-      { role: "user", content: "новый вопрос" },
-      { role: "assistant", content: "  новый ответ\n" },
-    ]);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
+      summary: null,
+      messages: [
+        ...previousHistory,
+        { role: "user", content: "новый вопрос" },
+        { role: "assistant", content: "  новый ответ\n" },
+      ],
+    });
     expect(result.usage.session.totalTokens).toBe(4);
 
     await agent.respond("ещё вопрос");
@@ -149,8 +155,8 @@ describe("Agent history repository", () => {
     const fake = fakeClient([{ content: "первый ответ" }, { content: "второй ответ" }]);
     const snapshots: Array<readonly HistoryMessage[]> = [];
     const historyRepository: HistoryRepository = {
-      load: () => loaded,
-      save(messages) {
+      load: () => ({ summary: null, messages: loaded }),
+      save({ messages }) {
         snapshots.push(messages);
         messages[0]!.content = "изменено при сохранении";
         messages.at(-1)!.content = "изменён ответ при сохранении";
@@ -182,7 +188,7 @@ describe("Agent history repository", () => {
     ]);
     const historyRepository = fakeHistory(previousHistory);
     const failure = new Error("Нет места для истории");
-    historyRepository.save.mockImplementationOnce((messages) => {
+    historyRepository.save.mockImplementationOnce(({ messages }) => {
       messages[0]!.content = "изменено при неудачном сохранении";
       throw failure;
     });
@@ -193,11 +199,14 @@ describe("Agent history repository", () => {
     const result = await agent.respond("новый вопрос");
 
     expect(fake.calls[1]!.messages.slice(1)).toEqual([...previousHistory, { role: "user", content: "новый вопрос" }]);
-    expect(historyRepository.save).toHaveBeenLastCalledWith([
-      ...previousHistory,
-      { role: "user", content: "новый вопрос" },
-      { role: "assistant", content: "успешный ответ" },
-    ]);
+    expect(historyRepository.save).toHaveBeenLastCalledWith({
+      summary: null,
+      messages: [
+        ...previousHistory,
+        { role: "user", content: "новый вопрос" },
+        { role: "assistant", content: "успешный ответ" },
+      ],
+    });
     expect(result.usage.turn.totalTokens).toBe(3);
     expect(result.usage.session.totalTokens).toBe(10);
   });
@@ -216,7 +225,7 @@ describe("Agent history repository", () => {
     });
 
     expect(() => agent.reset()).toThrow(failure);
-    expect(historyRepository.save).toHaveBeenLastCalledWith([]);
+    expect(historyRepository.save).toHaveBeenLastCalledWith({ summary: null, messages: [] });
     const result = await agent.respond("второй вопрос");
 
     expect(fake.calls[1]!.messages.slice(1)).toEqual([
@@ -391,12 +400,15 @@ describe("Agent request configuration", () => {
       reasoningTokens: 4,
       totalTokens: 12,
     });
-    expect(historyRepository.save).toHaveBeenLastCalledWith([
-      { role: "user", content: "исходная задача" },
-      { role: "assistant", content: "итоговый ответ" },
-      { role: "user", content: "продолжение" },
-      { role: "assistant", content: "следующий ответ" },
-    ]);
+    expect(historyRepository.save).toHaveBeenLastCalledWith({
+      summary: null,
+      messages: [
+        { role: "user", content: "исходная задача" },
+        { role: "assistant", content: "итоговый ответ" },
+        { role: "user", content: "продолжение" },
+        { role: "assistant", content: "следующий ответ" },
+      ],
+    });
   });
 
   it.each<{ name: string; failedReplies: Array<FakeReply | Error>; spentTokens: number }>([
@@ -438,10 +450,13 @@ describe("Agent request configuration", () => {
     ]);
     expect(result.usage.turn.totalTokens).toBe(5);
     expect(result.usage.session.totalTokens).toBe(spentTokens + 5);
-    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
-      { role: "user", content: "новый вопрос" },
-      { role: "assistant", content: "успешный ответ" },
-    ]);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
+      summary: null,
+      messages: [
+        { role: "user", content: "новый вопрос" },
+        { role: "assistant", content: "успешный ответ" },
+      ],
+    });
   });
 });
 
@@ -462,11 +477,13 @@ describe("Agent results and state", () => {
     const second = await agent.respond("два");
 
     expect(first.usage).toEqual({
+      summaryCall: null,
       finalCall: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 998 },
       turn: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 997 },
       session: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 999 },
     });
     expect(second.usage).toEqual({
+      summaryCall: null,
       finalCall: { promptTokens: 20, completionTokens: 6, reasoningTokens: 3, totalTokens: 26 },
       turn: { promptTokens: 20, completionTokens: 6, reasoningTokens: 3, totalTokens: 26 },
       session: { promptTokens: 30, completionTokens: 10, reasoningTokens: 5, totalTokens: 40 },
@@ -504,10 +521,13 @@ describe("Agent results and state", () => {
       validation: { ok: false, reason: "нет заголовка Markdown" },
     });
     expect(result).not.toHaveProperty("choices");
-    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
-      { role: "user", content: "вопрос" },
-      { role: "assistant", content: "обычный текст" },
-    ]);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
+      summary: null,
+      messages: [
+        { role: "user", content: "вопрос" },
+        { role: "assistant", content: "обычный текст" },
+      ],
+    });
 
     await agent.respond("следующий вопрос");
     expect(fake.calls[1]!.messages).toContainEqual({ role: "assistant", content: "обычный текст" });
@@ -539,10 +559,13 @@ describe("Agent results and state", () => {
 
       expect(fake.calls[1]!.messages.map((message) => message.role)).toEqual(["system", "user"]);
       expect(result.usage.session.totalTokens).toBe(11);
-      expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
-        { role: "user", content: "следующий вопрос" },
-        { role: "assistant", content: "следующий ответ" },
-      ]);
+      expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
+        summary: null,
+        messages: [
+          { role: "user", content: "следующий вопрос" },
+          { role: "assistant", content: "следующий ответ" },
+        ],
+      });
     },
   );
 
@@ -627,7 +650,7 @@ describe("Agent token estimates and input budget", () => {
     expect(systemOf(fake.calls[0]!)).toContain("Markdown");
     expect(systemOf(fake.calls[0]!)).toContain("Уложись в 20 слов.");
     expect(systemOf(fake.calls[0]!)).toContain("<END>");
-    expect(stack.slice(1, 3)).toEqual(historyRepository.load.mock.results[0]!.value);
+    expect(stack.slice(1, 3)).toEqual(historyRepository.load.mock.results[0]!.value.messages);
     expect(first.usage.session.totalTokens).toBe(0);
     expect(first.usage.finalCall.totalTokens).toBe(0);
     expect(second.tokenEstimate.questionTokens).toBe(2);
@@ -689,10 +712,13 @@ describe("Agent token estimates and input budget", () => {
     expect(restored.tokenEstimate.contextTokens).toBe(2);
     expect(restored.usage.session.totalTokens).toBe(8);
     expect(fake.calls).toHaveLength(9);
-    expect(historyRepository.save).toHaveBeenLastCalledWith([
-      { role: "user", content: "abcd" },
-      { role: "assistant", content: "abcd" },
-    ]);
+    expect(historyRepository.save).toHaveBeenLastCalledWith({
+      summary: null,
+      messages: [
+        { role: "user", content: "abcd" },
+        { role: "assistant", content: "abcd" },
+      ],
+    });
     await expect(agent.respond("x".repeat(100))).rejects.toThrow(AgentContextLimitError);
   });
 
@@ -705,7 +731,7 @@ describe("Agent token estimates and input budget", () => {
       config: config({ systemPrompt: "abcd", maxInputTokens: 2 }),
     });
     await expect(agent.respond("secret question")).rejects.toThrow(
-      "Оценка входного контекста ≈ 5 токенов превышает установленный лимит 2. Сократите вопрос или очистите историю командой /reset.",
+      "Этап «финальный ответ»: оценка входного контекста ≈ 5 токенов превышает установленный лимит 2. Сократите вопрос или очистите историю командой /reset.",
     );
     expect(fake.calls).toHaveLength(0);
     expect(historyRepository.save).not.toHaveBeenCalled();
@@ -737,10 +763,13 @@ describe("Agent token estimates and input budget", () => {
     expect(result.usage.session.totalTokens).toBe(12);
     expect(fake.calls[1]!.messages).toHaveLength(2);
     expect(fake.calls[2]!.messages).toHaveLength(2);
-    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith([
-      { role: "user", content: "новый вопрос" },
-      { role: "assistant", content: "ответ" },
-    ]);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
+      summary: null,
+      messages: [
+        { role: "user", content: "новый вопрос" },
+        { role: "assistant", content: "ответ" },
+      ],
+    });
   });
 
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
