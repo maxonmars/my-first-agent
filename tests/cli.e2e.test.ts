@@ -28,7 +28,14 @@ function runProcess(args: string[], input?: string, env = process.env) {
 }
 
 function mockEnvironment(): NodeJS.ProcessEnv {
-  return { ...process.env, DEEPSEEK_API_KEY: "sk-test", DEEPSEEK_MODEL: "mock-model", AGENT_MAX_INPUT_TOKENS: "" };
+  return {
+    ...process.env,
+    DEEPSEEK_API_KEY: "sk-test",
+    DEEPSEEK_MODEL: "mock-model",
+    AGENT_HISTORY_COMPRESSION: "true",
+    AGENT_KEEP_LAST_MESSAGES: "10",
+    AGENT_MAX_INPUT_TOKENS: "",
+  };
 }
 
 function readHistory(): unknown {
@@ -55,10 +62,13 @@ describe("CLI process", () => {
     expect(result.stdout).toContain("Эхо: проверка связи");
     expect(result.stdout).toContain("ход 8, сессия 8");
     expect(result.stderr).toBe("");
-    expect(readHistory()).toEqual([
-      { role: "user", content: "проверка связи" },
-      { role: "assistant", content: "Эхо: проверка связи" },
-    ]);
+    expect(readHistory()).toEqual({
+      summary: null,
+      messages: [
+        { role: "user", content: "проверка связи" },
+        { role: "assistant", content: "Эхо: проверка связи" },
+      ],
+    });
   });
 
   it("restores an interactive turn in a new one-shot process and starts token usage from zero", () => {
@@ -74,12 +84,15 @@ describe("CLI process", () => {
     expect(second.stdout).toContain("Вас зовут Максим.");
     expect(second.stdout).toContain("ход 8, сессия 8");
     expect(second.stderr).toBe("");
-    expect(readHistory()).toEqual([
-      { role: "user", content: "Меня зовут Максим" },
-      { role: "assistant", content: "Эхо: Меня зовут Максим" },
-      { role: "user", content: "Как меня зовут?" },
-      { role: "assistant", content: "Вас зовут Максим." },
-    ]);
+    expect(readHistory()).toEqual({
+      summary: null,
+      messages: [
+        { role: "user", content: "Меня зовут Максим" },
+        { role: "assistant", content: "Эхо: Меня зовут Максим" },
+        { role: "user", content: "Как меня зовут?" },
+        { role: "assistant", content: "Вас зовут Максим." },
+      ],
+    });
   });
 
   it("keeps an empty history file after reset and sends no old context after restart", () => {
@@ -88,17 +101,20 @@ describe("CLI process", () => {
     expect(first.status).toBe(0);
     expect(first.stdout).toContain("Контекст и статистика агента очищены.");
     expect(first.stderr).toBe("");
-    expect(readHistory()).toEqual([]);
+    expect(readHistory()).toEqual({ summary: null, messages: [] });
 
     const second = runProcess(["Есть ли предыдущий контекст?"], undefined, mockEnvironment());
 
     expect(second.status).toBe(0);
     expect(second.stdout).toContain("Предыдущих сообщений нет.");
     expect(second.stderr).toBe("");
-    expect(readHistory()).toEqual([
-      { role: "user", content: "Есть ли предыдущий контекст?" },
-      { role: "assistant", content: "Предыдущих сообщений нет." },
-    ]);
+    expect(readHistory()).toEqual({
+      summary: null,
+      messages: [
+        { role: "user", content: "Есть ли предыдущий контекст?" },
+        { role: "assistant", content: "Предыдущих сообщений нет." },
+      ],
+    });
   });
 
   it("fails startup with a corrupted history file and leaves its contents unchanged", () => {
@@ -127,14 +143,38 @@ it("blocks growing history locally and recovers through interactive reset", () =
   expect(result.stderr).toContain("≈ 21 токенов превышает установленный лимит 17");
   expect(result.stdout).toContain("ход 8, сессия 16");
   expect(result.stdout.split("Контекст и статистика агента очищены.")[1]).toContain("ход 8, сессия 8");
-  expect(readHistory()).toEqual([
-    { role: "user", content: "abcd" },
-    { role: "assistant", content: "Эхо: abcd" },
-  ]);
+  expect(readHistory()).toEqual({
+    summary: null,
+    messages: [
+      { role: "user", content: "abcd" },
+      { role: "assistant", content: "Эхо: abcd" },
+    ],
+  });
   const beforeRefusal = readFileSync(historyPath, "utf8");
   const blocked = runProcess(["x".repeat(100)], undefined, env);
   expect(blocked.status).toBe(1);
   expect(blocked.stdout).toBe("");
   expect(blocked.stderr).toContain("превышает установленный лимит 17");
   expect(readFileSync(historyPath, "utf8")).toBe(beforeRefusal);
+});
+
+it("persists compressed state and restores summary and tail in a new process", () => {
+  const env = mockEnvironment();
+  const first = runProcess([], `${Array.from({ length: 11 }, (_, i) => `ход ${i + 1}`).join("\n")}\n/exit\n`, env);
+  expect(first.status).toBe(0);
+  expect(first.stdout).toContain("API, summary:");
+  const compressed = JSON.parse(readFileSync(historyPath, "utf8"));
+  expect(compressed.summary).toBe("Факт из первых пяти ходов.");
+  expect(compressed.messages).toHaveLength(12);
+  expect(compressed.messages[0]).toEqual({ role: "user", content: "ход 6" });
+  const second = runProcess(["Проверь восстановленное summary"], undefined, {
+    ...env,
+    AGENT_HISTORY_COMPRESSION: "false",
+  });
+  expect(second.status).toBe(0);
+  expect(second.stdout).toContain("Summary и хвост восстановлены.");
+  expect(second.stdout).toContain("ход 8, сессия 8");
+  const reset = runProcess([], "/reset\n/exit\n", env);
+  expect(reset.status).toBe(0);
+  expect(readHistory()).toEqual({ summary: null, messages: [] });
 });

@@ -11,6 +11,8 @@ const saved = {
 describe("readConfig", () => {
   beforeEach(() => {
     vi.spyOn(process, "loadEnvFile").mockImplementation(() => {});
+    vi.stubEnv("AGENT_HISTORY_COMPRESSION", undefined);
+    vi.stubEnv("AGENT_KEEP_LAST_MESSAGES", undefined);
     delete process.env.DEEPSEEK_API_KEY;
     delete process.env.DEEPSEEK_MODEL;
     delete process.env.AGENT_MAX_INPUT_TOKENS;
@@ -18,6 +20,7 @@ describe("readConfig", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     restoreEnv("DEEPSEEK_API_KEY", saved.key);
     restoreEnv("DEEPSEEK_MODEL", saved.model);
     restoreEnv("AGENT_MAX_INPUT_TOKENS", saved.limit);
@@ -40,6 +43,35 @@ describe("readConfig", () => {
     process.env.AGENT_MAX_INPUT_TOKENS = value;
     expect(() => readConfig()).toThrow("AGENT_MAX_INPUT_TOKENS должен быть положительным безопасным целым числом");
   });
+
+  it.each([undefined, "", "   "])("uses compression defaults for %s", (value) => {
+    process.env.DEEPSEEK_API_KEY = "sk-test";
+    vi.stubEnv("AGENT_HISTORY_COMPRESSION", value);
+    vi.stubEnv("AGENT_KEEP_LAST_MESSAGES", value);
+    expect(readConfig().agent).toMatchObject({ historyCompressionEnabled: true, historyKeepLastMessages: 10 });
+  });
+  it.each(["true", "false"])("reads compression flag %s", (value) => {
+    process.env.DEEPSEEK_API_KEY = "sk-test";
+    vi.stubEnv("AGENT_HISTORY_COMPRESSION", ` ${value} `);
+    vi.stubEnv("AGENT_KEEP_LAST_MESSAGES", " 2 ");
+    expect(readConfig().agent).toMatchObject({
+      historyCompressionEnabled: value === "true",
+      historyKeepLastMessages: 2,
+    });
+  });
+  it.each(["1", "TRUE", "yes"])("rejects invalid compression flag %s", (value) => {
+    process.env.DEEPSEEK_API_KEY = "sk-test";
+    vi.stubEnv("AGENT_HISTORY_COMPRESSION", value);
+    expect(() => readConfig()).toThrow("AGENT_HISTORY_COMPRESSION");
+  });
+  it.each(["0", "-2", "3", "2.5", "NaN", "Infinity", "abc", "9007199254740992"])(
+    "rejects invalid keep count %s",
+    (value) => {
+      process.env.DEEPSEEK_API_KEY = "sk-test";
+      vi.stubEnv("AGENT_KEEP_LAST_MESSAGES", value);
+      expect(() => readConfig()).toThrow("AGENT_KEEP_LAST_MESSAGES");
+    },
+  );
 
   it("explains how to configure a missing or empty key", () => {
     expect(() => readConfig()).toThrow(API_KEY_MESSAGE);

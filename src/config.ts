@@ -14,6 +14,8 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = Object.freeze({
   stopMarker: null,
   temperature: null,
   thinkingEnabled: true,
+  historyCompressionEnabled: true,
+  historyKeepLastMessages: 10,
 });
 
 const API_KEY_MESSAGE = "Нет DEEPSEEK_API_KEY. Скопируй .env.example в .env и впиши свой ключ.";
@@ -21,6 +23,21 @@ const API_KEY_MESSAGE = "Нет DEEPSEEK_API_KEY. Скопируй .env.example 
 const EnvSchema = z.object({
   DEEPSEEK_API_KEY: z.string(API_KEY_MESSAGE).trim().min(1, API_KEY_MESSAGE),
   DEEPSEEK_MODEL: z.string().optional(),
+  AGENT_HISTORY_COMPRESSION: z
+    .string()
+    .optional()
+    .transform((value) => value?.trim() || "true")
+    .refine((value) => value === "true" || value === "false", {
+      message: "AGENT_HISTORY_COMPRESSION должен быть true или false.",
+    })
+    .transform((value) => value === "true"),
+  AGENT_KEEP_LAST_MESSAGES: z
+    .string()
+    .optional()
+    .transform((value) => (value?.trim() ? Number(value.trim()) : 10))
+    .refine((value) => Number.isSafeInteger(value) && value > 0 && value % 2 === 0, {
+      message: "AGENT_KEEP_LAST_MESSAGES должен быть положительным чётным безопасным целым числом.",
+    }),
   AGENT_MAX_INPUT_TOKENS: z
     .string()
     .optional()
@@ -51,7 +68,13 @@ export function readConfig(): AppConfig {
 
   return {
     apiKey: result.data.DEEPSEEK_API_KEY,
-    agent: { ...DEFAULT_AGENT_CONFIG, model, maxInputTokens: result.data.AGENT_MAX_INPUT_TOKENS },
+    agent: {
+      ...DEFAULT_AGENT_CONFIG,
+      model,
+      maxInputTokens: result.data.AGENT_MAX_INPUT_TOKENS,
+      historyCompressionEnabled: result.data.AGENT_HISTORY_COMPRESSION,
+      historyKeepLastMessages: result.data.AGENT_KEEP_LAST_MESSAGES,
+    },
   };
 }
 
