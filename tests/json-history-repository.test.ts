@@ -2,7 +2,7 @@ import { mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { HistoryMessage } from "../src/history.ts";
+import type { HistoryMessage, HistoryState } from "../src/history.ts";
 import { JsonHistoryRepository } from "../src/json-history-repository.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -47,16 +47,18 @@ describe("JSON history repository", () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
-  it("returns an empty history when the file does not exist", () => {
-    expect(repository.load()).toEqual({ summary: null, messages: [] });
+  it("returns null when the file does not exist", () => {
+    expect(repository.load()).toBeNull();
     expect(readdirSync(directory)).toEqual([]);
   });
 
   it("saves UTF-8 JSON with indentation and reloads Unicode and whitespace unchanged", () => {
-    repository.save({ summary: null, messages: originalHistory });
+    repository.save({ kind: "sliding", messages: originalHistory });
 
-    expect(readFileSync(filePath, "utf8")).toBe(JSON.stringify({ summary: null, messages: originalHistory }, null, 2));
-    expect(new JsonHistoryRepository(filePath).load()).toEqual({ summary: null, messages: originalHistory });
+    expect(readFileSync(filePath, "utf8")).toBe(
+      JSON.stringify({ kind: "sliding", messages: originalHistory }, null, 2),
+    );
+    expect(new JsonHistoryRepository(filePath).load()).toEqual({ kind: "sliding", messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
     const [temporaryPath, destination] = vi.mocked(renameSync).mock.calls[0];
     expect(temporaryPath).toMatch(new RegExp(`^${filePath.replaceAll(".", "\\.")}\\.[0-9a-f-]{36}\\.tmp$`));
@@ -65,42 +67,78 @@ describe("JSON history repository", () => {
   });
 
   it("replaces previous history and persists an empty state without deleting the file", () => {
-    repository.save({ summary: null, messages: originalHistory });
-    repository.save({ summary: null, messages: nextHistory });
-    expect(repository.load()).toEqual({ summary: null, messages: nextHistory });
+    repository.save({ kind: "sliding", messages: originalHistory });
+    repository.save({ kind: "sliding", messages: nextHistory });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: nextHistory });
 
-    repository.save({ summary: null, messages: [] });
-    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual({ summary: null, messages: [] });
-    expect(repository.load()).toEqual({ summary: null, messages: [] });
+    repository.save({ kind: "sliding", messages: [] });
+    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual({ kind: "sliding", messages: [] });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: [] });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
   });
 
-  it("reads a legacy array without rewriting it and writes the object on the next save", () => {
-    const source = JSON.stringify(originalHistory);
-    writeFileSync(filePath, source);
-    const state = repository.load();
-    expect(state).toEqual({ summary: null, messages: originalHistory });
-    expect(readFileSync(filePath, "utf8")).toBe(source);
-    repository.save(state);
-    expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual(state);
-  });
+  it.each([originalHistory, { summary: "old summary", messages: originalHistory }])(
+    "reads legacy state without rewriting it and preserves its format on save",
+    (state) => {
+      const source = JSON.stringify(state);
+      writeFileSync(filePath, source);
+      const expected = { summary: Array.isArray(state) ? null : state.summary, messages: originalHistory };
+      expect(repository.load()).toEqual({ kind: "compression", ...expected });
+      expect(readFileSync(filePath, "utf8")).toBe(source);
+      repository.save({ kind: "compression", ...expected });
+      expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual(expected);
+    },
+  );
 
-  it("restores summary and tail unchanged", () => {
-    const state = { summary: "  Факт: код 007.\n", messages: originalHistory };
+  it.each<HistoryState>([
+    { kind: "facts", facts: { code: "007" }, messages: originalHistory },
+    {
+      kind: "branching",
+      activeBranch: "вариант-а",
+      branches: { main: originalHistory, "вариант-а": nextHistory },
+      checkpoint: originalHistory,
+    },
+    { kind: "branching", activeBranch: "main", branches: { main: [] }, checkpoint: null },
+  ])("restores $kind state unchanged", (state) => {
     repository.save(state);
     expect(new JsonHistoryRepository(filePath).load()).toEqual(state);
   });
 
-  it.each(["", " \n", 42, undefined])("rejects invalid summary %s without rewriting", (summary) => {
-    const source = JSON.stringify({ summary, messages: originalHistory });
+  it.each([{}, { "": "value" }, { name: "" }, { name: 42 }])("validates facts structure %j", (facts) => {
+    const state = { kind: "facts", facts, messages: originalHistory };
+    const source = JSON.stringify(state);
     writeFileSync(filePath, source);
-    expect(() => repository.load()).toThrow("неверная структура");
+    if (Object.keys(facts).length === 0) expect(repository.load()).toEqual(state);
+    else expect(() => repository.load()).toThrow("неверная структура");
     expect(readFileSync(filePath, "utf8")).toBe(source);
   });
 
-  it("checks pairs in the new format", () => {
-    writeFileSync(filePath, JSON.stringify({ summary: "summary", messages: [originalHistory[0]] }));
+  it.each([{ main: originalHistory }, { missing: originalHistory }])(
+    "rejects missing active or main branch",
+    (branches) => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({ kind: "branching", activeBranch: "missing", branches, checkpoint: null }),
+      );
+      expect(() => repository.load()).toThrow("отсутствует main или активная ветка");
+    },
+  );
+
+  it.each(["branch", "checkpoint"])("validates pairs inside %s on load and save", (location) => {
+    const state: HistoryState = {
+      kind: "branching",
+      activeBranch: "main",
+      branches: { main: originalHistory },
+      checkpoint: originalHistory,
+    };
+    if (location === "branch") state.branches.other = [originalHistory[0]!];
+    else state.checkpoint = [originalHistory[1]!, originalHistory[0]!];
+    writeFileSync(filePath, JSON.stringify(state));
     expect(() => repository.load()).toThrow("нарушен порядок пар");
+    repository.save({ kind: "sliding", messages: originalHistory });
+    const source = readFileSync(filePath, "utf8");
+    expect(() => repository.save(state)).toThrow("нарушен порядок пар");
+    expect(readFileSync(filePath, "utf8")).toBe(source);
   });
 
   it("rejects malformed JSON without exposing content or changing the file", () => {
@@ -124,7 +162,7 @@ describe("JSON history repository", () => {
     ["whitespace-only content", [{ role: "user", content: " \t\n " }]],
     ["extra field", [{ role: "user", content: "секрет диалога", apiKey: "private" }]],
   ])("rejects %s without changing the file", (_name, value) => {
-    const source = JSON.stringify(value);
+    const source = JSON.stringify(Array.isArray(value) ? { kind: "sliding", messages: value } : value);
     writeFileSync(filePath, source, "utf8");
 
     expect(() => repository.load()).toThrow(
@@ -140,7 +178,7 @@ describe("JSON history repository", () => {
     ["two user messages", [originalHistory[0], originalHistory[0]]],
     ["an invalid later pair", [...originalHistory, originalHistory[1], originalHistory[0]]],
   ])("rejects %s without changing the file", (_name, messages) => {
-    const source = JSON.stringify(messages);
+    const source = JSON.stringify({ kind: "sliding", messages });
     writeFileSync(filePath, source, "utf8");
 
     expect(() => repository.load()).toThrow(
@@ -160,7 +198,7 @@ describe("JSON history repository", () => {
   });
 
   it("reports EACCES without exposing the original error or changing the history", () => {
-    repository.save({ summary: null, messages: originalHistory });
+    repository.save({ kind: "sliding", messages: originalHistory });
     vi.mocked(readFileSync).mockImplementationOnce(() => {
       throw fileError("EACCES");
     });
@@ -168,7 +206,7 @@ describe("JSON history repository", () => {
     expect(() => repository.load()).toThrow(
       `Не удалось загрузить историю из «${filePath}»: ошибка чтения файла (EACCES).`,
     );
-    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: originalHistory });
   });
 
   it.each([
@@ -185,41 +223,41 @@ describe("JSON history repository", () => {
   });
 
   it("keeps the old file and removes the partial temporary file when writing fails", () => {
-    repository.save({ summary: null, messages: originalHistory });
+    repository.save({ kind: "sliding", messages: originalHistory });
     const previousSource = readFileSync(filePath, "utf8");
     vi.mocked(writeFileSync).mockImplementationOnce((path) => {
       realFs.writeFileSync(path, "partial write", "utf8");
       throw fileError("ENOSPC");
     });
 
-    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
+    expect(() => repository.save({ kind: "sliding", messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка записи временного файла (ENOSPC).`,
     );
     expect(readFileSync(filePath, "utf8")).toBe(previousSource);
-    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
   });
 
   it("keeps the old file and cleans up the temporary file when replacement fails", () => {
-    repository.save({ summary: null, messages: originalHistory });
+    repository.save({ kind: "sliding", messages: originalHistory });
     const previousSource = readFileSync(filePath, "utf8");
     vi.mocked(renameSync).mockImplementationOnce(() => {
       throw fileError("EACCES");
     });
 
-    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
+    expect(() => repository.save({ kind: "sliding", messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка замены файла (EACCES).`,
     );
     expect(readFileSync(filePath, "utf8")).toBe(previousSource);
-    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
 
-    repository.save({ summary: null, messages: nextHistory });
-    expect(repository.load()).toEqual({ summary: null, messages: nextHistory });
+    repository.save({ kind: "sliding", messages: nextHistory });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: nextHistory });
   });
 
   it("preserves the replacement error when temporary file cleanup also fails", () => {
-    repository.save({ summary: null, messages: originalHistory });
+    repository.save({ kind: "sliding", messages: originalHistory });
     vi.mocked(renameSync).mockImplementationOnce(() => {
       throw fileError("EACCES");
     });
@@ -227,23 +265,23 @@ describe("JSON history repository", () => {
       throw fileError("EPERM");
     });
 
-    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
+    expect(() => repository.save({ kind: "sliding", messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка замены файла (EACCES).`,
     );
-    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: originalHistory });
     expect(readdirSync(directory)).toHaveLength(2);
   });
 
   it("reports the original write error when no temporary file was created", () => {
-    repository.save({ summary: null, messages: originalHistory });
+    repository.save({ kind: "sliding", messages: originalHistory });
     vi.mocked(writeFileSync).mockImplementationOnce(() => {
       throw new Error("секрет диалога");
     });
 
-    expect(() => repository.save({ summary: null, messages: nextHistory })).toThrow(
+    expect(() => repository.save({ kind: "sliding", messages: nextHistory })).toThrow(
       `Не удалось сохранить историю в «${filePath}»: ошибка записи временного файла.`,
     );
-    expect(repository.load()).toEqual({ summary: null, messages: originalHistory });
+    expect(repository.load()).toEqual({ kind: "sliding", messages: originalHistory });
     expect(readdirSync(directory)).toEqual([".agent-history.json"]);
   });
 });

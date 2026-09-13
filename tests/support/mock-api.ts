@@ -42,6 +42,53 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
     content = "Summary и хвост восстановлены.";
   }
 
+  if (request.messages[0]?.content.startsWith("Обнови память facts")) {
+    const source = JSON.parse(question);
+    if (source.question === "Меня зовут Максим") {
+      deepStrictEqual(source.facts, {});
+      deepStrictEqual(source.messages, []);
+    } else {
+      deepStrictEqual(source.facts, { name: "Максим" });
+      deepStrictEqual(source.messages.length, 2);
+    }
+    content = '{"name":"Максим"}';
+  }
+  if (question === "Проверь facts после перезапуска") {
+    deepStrictEqual(request.messages[1]?.role, "user");
+    deepStrictEqual(JSON.parse(request.messages[1]!.content.split("\n")[1]!), { name: "Максим" });
+    deepStrictEqual(request.messages.slice(2, -1), [
+      { role: "user", content: "промежуточный" },
+      { role: "assistant", content: "Эхо: промежуточный" },
+    ]);
+    content = "Facts и окно восстановлены.";
+  }
+  if (question === "Проверь ветку A") {
+    deepStrictEqual(request.messages.slice(1, -1), [
+      { role: "user", content: "общая цель" },
+      { role: "assistant", content: "Эхо: общая цель" },
+      { role: "user", content: "срок A" },
+      { role: "assistant", content: "Эхо: срок A" },
+    ]);
+    content = "Ветка A восстановлена без B.";
+  }
+  if (question === "Проверь checkpoint") {
+    deepStrictEqual(request.messages.slice(1, -1), [
+      { role: "user", content: "общая цель" },
+      { role: "assistant", content: "Эхо: общая цель" },
+    ]);
+    content = "Checkpoint восстановлен.";
+  }
+  if (question === "Проверь окно") {
+    deepStrictEqual(
+      request.messages.slice(1, -1),
+      Array.from({ length: 5 }, (_, i) => [
+        { role: "user", content: `ход ${i + 7}` },
+        { role: "assistant", content: `Эхо: ход ${i + 7}` },
+      ]).flat(),
+    );
+    content = "Окно восстановлено.";
+  }
+
   if (question === "Как меня зовут?") {
     deepStrictEqual(request.messages.slice(1), [
       { role: "user", content: "Меня зовут Максим" },

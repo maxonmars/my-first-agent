@@ -11,6 +11,7 @@ const saved = {
 describe("readConfig", () => {
   beforeEach(() => {
     vi.spyOn(process, "loadEnvFile").mockImplementation(() => {});
+    vi.stubEnv("AGENT_CONTEXT_STRATEGY", undefined);
     vi.stubEnv("AGENT_HISTORY_COMPRESSION", undefined);
     vi.stubEnv("AGENT_KEEP_LAST_MESSAGES", undefined);
     delete process.env.DEEPSEEK_API_KEY;
@@ -44,25 +45,28 @@ describe("readConfig", () => {
     expect(() => readConfig()).toThrow("AGENT_MAX_INPUT_TOKENS должен быть положительным безопасным целым числом");
   });
 
-  it.each([undefined, "", "   "])("uses compression defaults for %s", (value) => {
+  it.each([undefined, "", "   "])("uses context defaults for %s", (value) => {
     process.env.DEEPSEEK_API_KEY = "sk-test";
-    vi.stubEnv("AGENT_HISTORY_COMPRESSION", value);
+    vi.stubEnv("AGENT_CONTEXT_STRATEGY", value);
     vi.stubEnv("AGENT_KEEP_LAST_MESSAGES", value);
-    expect(readConfig().agent).toMatchObject({ historyCompressionEnabled: true, historyKeepLastMessages: 10 });
+    expect(readConfig().agent).toMatchObject({
+      contextStrategy: null,
+      historyKeepLastMessages: 10,
+    });
   });
-  it.each(["true", "false"])("reads compression flag %s", (value) => {
+  it.each(["compression", "sliding", "facts", "branching"])("reads context strategy %s", (value) => {
     process.env.DEEPSEEK_API_KEY = "sk-test";
-    vi.stubEnv("AGENT_HISTORY_COMPRESSION", ` ${value} `);
+    vi.stubEnv("AGENT_CONTEXT_STRATEGY", ` ${value} `);
     vi.stubEnv("AGENT_KEEP_LAST_MESSAGES", " 2 ");
     expect(readConfig().agent).toMatchObject({
-      historyCompressionEnabled: value === "true",
+      contextStrategy: value,
       historyKeepLastMessages: 2,
     });
   });
-  it.each(["1", "TRUE", "yes"])("rejects invalid compression flag %s", (value) => {
+  it.each(["1", "TRUE", "yes"])("rejects invalid context strategy %s", (value) => {
     process.env.DEEPSEEK_API_KEY = "sk-test";
-    vi.stubEnv("AGENT_HISTORY_COMPRESSION", value);
-    expect(() => readConfig()).toThrow("AGENT_HISTORY_COMPRESSION");
+    vi.stubEnv("AGENT_CONTEXT_STRATEGY", value);
+    expect(() => readConfig()).toThrow("AGENT_CONTEXT_STRATEGY");
   });
   it.each(["0", "-2", "3", "2.5", "NaN", "Infinity", "abc", "9007199254740992"])(
     "rejects invalid keep count %s",
@@ -131,3 +135,19 @@ function restoreEnv(
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
 }
+
+it.each(["true", "false", "invalid"])("ignores the removed compression flag %s", (value) => {
+  vi.spyOn(process, "loadEnvFile").mockImplementation(() => {});
+  vi.stubEnv("DEEPSEEK_API_KEY", "sk-test");
+  vi.stubEnv("AGENT_CONTEXT_STRATEGY", "");
+  vi.stubEnv("AGENT_HISTORY_COMPRESSION", value);
+  try {
+    expect(readConfig().agent.contextStrategy).toBeNull();
+    expect(readConfig().agent).not.toHaveProperty("historyCompressionEnabled");
+    vi.stubEnv("AGENT_CONTEXT_STRATEGY", "compression");
+    expect(readConfig().agent.contextStrategy).toBe("compression");
+  } finally {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+});

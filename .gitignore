@@ -9,6 +9,8 @@ coverage/
 # Локальная история диалога и временные файлы записи.
 .agent-history.json
 .agent-history.json.*.tmp
+.agent-history.*.json
+.agent-history.*.json.*.tmp
 
 # macOS
 .DS_Store
