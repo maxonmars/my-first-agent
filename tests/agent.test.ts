@@ -15,12 +15,12 @@ import type { DeepSeekParams, LlmClient, LlmCompletion } from "../src/llm-client
 import { completionResponse, type FakeReply, fakeClient, systemOf } from "./support/fake-client.ts";
 
 function config(overrides: Partial<AgentConfig> = {}): AgentConfig {
-  return { ...DEFAULT_AGENT_CONFIG, ...overrides };
+  return { ...DEFAULT_AGENT_CONFIG, contextStrategy: "sliding", ...overrides };
 }
 
 function fakeHistory(messages: HistoryMessage[] = []) {
   return {
-    load: vi.fn<HistoryRepository["load"]>(() => ({ summary: null, messages })),
+    load: vi.fn<HistoryRepository["load"]>(() => ({ kind: "sliding", messages })),
     save: vi.fn<HistoryRepository["save"]>(),
   };
 }
@@ -72,7 +72,7 @@ describe("Agent history", () => {
     expect(fake.calls[2]!.messages).not.toContainEqual({ role: "user", content: "сломанный вопрос" });
     expect(result.usage.session.totalTokens).toBe(8);
     expect(historyRepository.save).toHaveBeenLastCalledWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         { role: "user", content: "первый вопрос" },
         { role: "assistant", content: "первый ответ" },
@@ -92,7 +92,7 @@ describe("Agent history", () => {
 
     await agent.respond("первый вопрос");
     agent.reset();
-    expect(historyRepository.save).toHaveBeenLastCalledWith({ summary: null, messages: [] });
+    expect(historyRepository.save).toHaveBeenLastCalledWith({ kind: "sliding", messages: [] });
     const result = await agent.respond("новый вопрос");
 
     expect(fake.calls[1]!.model).toBe("test-model");
@@ -120,7 +120,7 @@ describe("Agent history repository", () => {
       { role: "user", content: "новый вопрос" },
     ]);
     expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         ...previousHistory,
         { role: "user", content: "новый вопрос" },
@@ -155,8 +155,10 @@ describe("Agent history repository", () => {
     const fake = fakeClient([{ content: "первый ответ" }, { content: "второй ответ" }]);
     const snapshots: Array<readonly HistoryMessage[]> = [];
     const historyRepository: HistoryRepository = {
-      load: () => ({ summary: null, messages: loaded }),
-      save({ messages }) {
+      load: () => ({ kind: "sliding", messages: loaded }),
+      save(state) {
+        if (state.kind !== "sliding") throw new Error("Expected sliding state");
+        const { messages } = state;
         snapshots.push(messages);
         messages[0]!.content = "изменено при сохранении";
         messages.at(-1)!.content = "изменён ответ при сохранении";
@@ -188,7 +190,9 @@ describe("Agent history repository", () => {
     ]);
     const historyRepository = fakeHistory(previousHistory);
     const failure = new Error("Нет места для истории");
-    historyRepository.save.mockImplementationOnce(({ messages }) => {
+    historyRepository.save.mockImplementationOnce((state) => {
+      if (state.kind !== "sliding") throw new Error("Expected sliding state");
+      const { messages } = state;
       messages[0]!.content = "изменено при неудачном сохранении";
       throw failure;
     });
@@ -200,7 +204,7 @@ describe("Agent history repository", () => {
 
     expect(fake.calls[1]!.messages.slice(1)).toEqual([...previousHistory, { role: "user", content: "новый вопрос" }]);
     expect(historyRepository.save).toHaveBeenLastCalledWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         ...previousHistory,
         { role: "user", content: "новый вопрос" },
@@ -225,7 +229,7 @@ describe("Agent history repository", () => {
     });
 
     expect(() => agent.reset()).toThrow(failure);
-    expect(historyRepository.save).toHaveBeenLastCalledWith({ summary: null, messages: [] });
+    expect(historyRepository.save).toHaveBeenLastCalledWith({ kind: "sliding", messages: [] });
     const result = await agent.respond("второй вопрос");
 
     expect(fake.calls[1]!.messages.slice(1)).toEqual([
@@ -401,7 +405,7 @@ describe("Agent request configuration", () => {
       totalTokens: 12,
     });
     expect(historyRepository.save).toHaveBeenLastCalledWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         { role: "user", content: "исходная задача" },
         { role: "assistant", content: "итоговый ответ" },
@@ -451,7 +455,7 @@ describe("Agent request configuration", () => {
     expect(result.usage.turn.totalTokens).toBe(5);
     expect(result.usage.session.totalTokens).toBe(spentTokens + 5);
     expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         { role: "user", content: "новый вопрос" },
         { role: "assistant", content: "успешный ответ" },
@@ -477,12 +481,14 @@ describe("Agent results and state", () => {
     const second = await agent.respond("два");
 
     expect(first.usage).toEqual({
+      factsCall: null,
       summaryCall: null,
       finalCall: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 998 },
       turn: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 997 },
       session: { promptTokens: 10, completionTokens: 4, reasoningTokens: 2, totalTokens: 999 },
     });
     expect(second.usage).toEqual({
+      factsCall: null,
       summaryCall: null,
       finalCall: { promptTokens: 20, completionTokens: 6, reasoningTokens: 3, totalTokens: 26 },
       turn: { promptTokens: 20, completionTokens: 6, reasoningTokens: 3, totalTokens: 26 },
@@ -522,7 +528,7 @@ describe("Agent results and state", () => {
     });
     expect(result).not.toHaveProperty("choices");
     expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         { role: "user", content: "вопрос" },
         { role: "assistant", content: "обычный текст" },
@@ -560,7 +566,7 @@ describe("Agent results and state", () => {
       expect(fake.calls[1]!.messages.map((message) => message.role)).toEqual(["system", "user"]);
       expect(result.usage.session.totalTokens).toBe(11);
       expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
-        summary: null,
+        kind: "sliding",
         messages: [
           { role: "user", content: "следующий вопрос" },
           { role: "assistant", content: "следующий ответ" },
@@ -683,7 +689,7 @@ describe("Agent token estimates and input budget", () => {
     const agent = new Agent({
       client: fake.client,
       historyRepository,
-      config: config({ systemPrompt: "abcd", maxInputTokens: 16 }),
+      config: config({ systemPrompt: "abcd", maxInputTokens: 16, historyKeepLastMessages: 20 }),
     });
     const estimates: number[] = [];
     for (let index = 0; index < 8; index += 1) {
@@ -713,7 +719,7 @@ describe("Agent token estimates and input budget", () => {
     expect(restored.usage.session.totalTokens).toBe(8);
     expect(fake.calls).toHaveLength(9);
     expect(historyRepository.save).toHaveBeenLastCalledWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         { role: "user", content: "abcd" },
         { role: "assistant", content: "abcd" },
@@ -764,7 +770,7 @@ describe("Agent token estimates and input budget", () => {
     expect(fake.calls[1]!.messages).toHaveLength(2);
     expect(fake.calls[2]!.messages).toHaveLength(2);
     expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
-      summary: null,
+      kind: "sliding",
       messages: [
         { role: "user", content: "новый вопрос" },
         { role: "assistant", content: "ответ" },

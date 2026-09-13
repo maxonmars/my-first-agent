@@ -6,6 +6,8 @@ import type { DeepSeekParams, LlmCompletion } from "../src/llm-client.ts";
 import { estimateContextTokens } from "../src/tokens.ts";
 import { completionResponse, type FakeReply, fakeClient } from "./support/fake-client.ts";
 
+type CompressionState = Extract<HistoryState, { kind: "compression" }>;
+
 function messages(count: number): HistoryMessage[] {
   return Array.from({ length: count }, (_, i) => ({
     role: i % 2 === 0 ? "user" : "assistant",
@@ -14,7 +16,7 @@ function messages(count: number): HistoryMessage[] {
 }
 function setup(
   replies: Array<FakeReply | Error>,
-  state: HistoryState = { summary: null, messages: messages(20) },
+  state: CompressionState = { kind: "compression" as const, summary: null, messages: messages(20) },
   config: Partial<AgentConfig> = {},
 ) {
   const fake = fakeClient(replies);
@@ -22,7 +24,7 @@ function setup(
   const agent = new Agent({
     client: fake.client,
     historyRepository: repository,
-    config: { ...DEFAULT_AGENT_CONFIG, ...config },
+    config: { ...DEFAULT_AGENT_CONFIG, contextStrategy: "compression", ...config },
   });
   return { ...fake, repository, agent };
 }
@@ -35,7 +37,7 @@ describe("periodic compression", () => {
       if (turn === 11 || turn === 16) replies.push({ content: `summary-${turn}` });
       replies.push({ content: `answer-${turn}` });
     }
-    const { agent, calls, repository } = setup(replies, { summary: null, messages: [] });
+    const { agent, calls, repository } = setup(replies, { kind: "compression" as const, summary: null, messages: [] });
     for (let turn = 1; turn <= 20; turn++) {
       const result = await agent.respond(`question-${turn}`);
       expect(result.usage.summaryCall !== null).toBe(turn === 11 || turn === 16);
@@ -43,18 +45,23 @@ describe("periodic compression", () => {
     expect(calls).toHaveLength(22);
     const firstSource = JSON.parse(String(calls[10]!.messages[1]!.content));
     const secondSource = JSON.parse(String(calls[16]!.messages[1]!.content));
-    expect(firstSource).toEqual({ summary: null, messages: repository.save.mock.calls[4]![0].messages });
+    expect(firstSource).toEqual({
+      summary: null,
+      messages: (repository.save.mock.calls[4]![0] as CompressionState).messages,
+    });
     expect(secondSource).toEqual({
       summary: "summary-11",
-      messages: repository.save.mock.calls[9]![0].messages.slice(10),
+      messages: (repository.save.mock.calls[9]![0] as CompressionState).messages.slice(10),
     });
-    expect(calls[11]!.messages.slice(2, -1)).toEqual(repository.save.mock.calls[9]![0].messages.slice(10));
-    expect(repository.save.mock.calls[10]![0].messages).toHaveLength(12);
-    expect(repository.save.mock.calls[19]![0].summary).toBe("summary-16");
+    expect(calls[11]!.messages.slice(2, -1)).toEqual(
+      (repository.save.mock.calls[9]![0] as CompressionState).messages.slice(10),
+    );
+    expect((repository.save.mock.calls[10]![0] as CompressionState).messages).toHaveLength(12);
+    expect((repository.save.mock.calls[19]![0] as CompressionState).summary).toBe("summary-16");
   });
 
   it.each([18, 20, 42])("uses only the saved messages at length %s", async (count) => {
-    const state = { summary: null, messages: messages(count) };
+    const state = { kind: "compression" as const, summary: null, messages: messages(count) };
     const compresses = count >= 20;
     const { agent, calls, repository } = setup(compresses ? [summaryReply, {}] : [{}], state);
     await agent.respond(" новый вопрос ");
@@ -65,22 +72,32 @@ describe("periodic compression", () => {
         messages: state.messages.slice(0, -10),
       });
       expect(calls[1]!.messages.slice(2, -1)).toEqual(state.messages.slice(-10));
-      expect(repository.save.mock.calls[0]![0].messages.slice(0, -2)).toEqual(state.messages.slice(-10));
+      expect((repository.save.mock.calls[0]![0] as CompressionState).messages.slice(0, -2)).toEqual(
+        state.messages.slice(-10),
+      );
     }
     expect(calls.at(-1)!.messages.at(-1)).toEqual({ role: "user", content: "новый вопрос" });
   });
 
-  it.each([null, "Ранее сохранённая сводка"])("keeps summary %s when compression is disabled", async (summary) => {
-    const { agent, calls } = setup([{}], { summary, messages: messages(40) }, { historyCompressionEnabled: false });
-    const result = await agent.respond("вопрос");
-    expect(calls).toHaveLength(1);
-    expect(result.usage.summaryCall).toBeNull();
-    expect(calls[0]!.messages.slice(summary === null ? 1 : 2, -1)).toEqual(messages(40));
-    if (summary !== null) {
-      expect(calls[0]!.messages[1]).toMatchObject({ role: "user", content: expect.stringContaining(summary) });
-      expect(calls[0]!.messages[0]!.content).not.toContain(summary);
-    }
-  });
+  it.each([null, "Ранее сохранённая сводка"])(
+    "keeps summary %s and full history when no strategy is selected",
+    async (summary) => {
+      const { agent, calls, repository } = setup(
+        [{}],
+        { kind: "compression", summary, messages: messages(40) },
+        { contextStrategy: null },
+      );
+      const result = await agent.respond("вопрос");
+      expect(calls).toHaveLength(1);
+      expect(result.usage.summaryCall).toBeNull();
+      expect(calls[0]!.messages.slice(summary === null ? 1 : 2, -1)).toEqual(messages(40));
+      expect((repository.save.mock.lastCall![0] as CompressionState).messages).toHaveLength(42);
+      if (summary !== null) {
+        expect(calls[0]!.messages[1]).toMatchObject({ role: "user", content: expect.stringContaining(summary) });
+        expect(calls[0]!.messages[0]!.content).not.toContain(summary);
+      }
+    },
+  );
 
   it("shares the candidate between meta and final, isolates summary policy and accounts for all calls", async () => {
     const { agent, calls } = setup(
@@ -133,13 +150,13 @@ describe("periodic compression", () => {
     { stage: "final transport", failed: [summaryReply, { totalTokens: 7 }, new Error("final")], spent: 22 },
     { stage: "empty final", failed: [summaryReply, { totalTokens: 7 }, { content: "", totalTokens: 9 }], spent: 31 },
   ])("rolls back candidate after $stage and keeps spent usage", async ({ failed, spent }) => {
-    const state = { summary: "old summary", messages: messages(20) };
+    const state = { kind: "compression" as const, summary: "old summary", messages: messages(20) };
     const { agent, calls, repository } = setup([...failed, summaryReply, {}, {}], state, { strategy: "meta" });
     await expect(agent.respond("failed question")).rejects.toThrow();
     expect(repository.save).not.toHaveBeenCalled();
     const result = await agent.respond("retry question");
     expect(calls[failed.length]!.messages).toEqual(calls[0]!.messages);
-    expect(state).toEqual({ summary: "old summary", messages: messages(20) });
+    expect(state).toEqual({ kind: "compression" as const, summary: "old summary", messages: messages(20) });
     expect(result.usage.session.totalTokens).toBe(spent + 15);
     expect(result.usage.turn.totalTokens).toBe(15);
   });
@@ -155,7 +172,8 @@ describe("periodic compression", () => {
       undefined,
       { format: "json" },
     );
-    repository.save.mockImplementationOnce((state) => {
+    repository.save.mockImplementationOnce((saved) => {
+      const state = saved as CompressionState;
       state.summary = "mutated";
       state.messages[0]!.content = "mutated";
       throw new Error("disk");
@@ -166,7 +184,7 @@ describe("periodic compression", () => {
     expect(result.finishReason).toBe("length");
     expect(result.validation.ok).toBe(false);
     expect(result.usage.session.totalTokens).toBe(33);
-    expect(repository.save.mock.calls[1]![0].summary).toBe("Сводка");
+    expect((repository.save.mock.calls[1]![0] as CompressionState).summary).toBe("Сводка");
   });
 
   it("reset saves both empty fields, preserves state and usage on failure, and keeps configuration", async () => {
@@ -180,7 +198,7 @@ describe("periodic compression", () => {
     expect(result.usage.session.totalTokens).toBe(15);
     expect(calls[2]!.messages[1]!.content).toContain("Сводка");
     agent.reset();
-    expect(repository.save).toHaveBeenLastCalledWith({ summary: null, messages: [] });
+    expect(repository.save).toHaveBeenLastCalledWith({ kind: "compression" as const, summary: null, messages: [] });
     expect((await agent.respond("third")).usage.session.totalTokens).toBe(0);
     expect(calls[3]!.messages).toHaveLength(2);
     expect(calls[3]!.model).toBe("custom");
@@ -192,12 +210,6 @@ describe("periodic compression", () => {
       expect(() => setup([], undefined, { historyKeepLastMessages })).toThrow(AgentConfigError);
     },
   );
-  it("rejects a nonboolean compression flag", () => {
-    expect(() => setup([], undefined, { historyCompressionEnabled: "true" as unknown as boolean })).toThrow(
-      AgentConfigError,
-    );
-  });
-
   it.each([0, 1, 2])("holds busy while call %s is pending", async (pendingIndex) => {
     let release!: (value: LlmCompletion) => void;
     const calls: DeepSeekParams[] = [];
@@ -213,10 +225,11 @@ describe("periodic compression", () => {
     };
     const agent = new Agent({
       client,
-      config: { ...DEFAULT_AGENT_CONFIG, strategy: "meta" },
+      config: { ...DEFAULT_AGENT_CONFIG, contextStrategy: "compression", strategy: "meta" },
       historyRepository: {
-        load: () => ({ summary: null, messages: messages(20) }),
-        save(state) {
+        load: () => ({ kind: "compression" as const, summary: null, messages: messages(20) }),
+        save(saved) {
+          const state = saved as CompressionState;
           if (state.messages.length) expect(() => agent.reset()).toThrow(AgentBusyError);
         },
       },
@@ -254,4 +267,25 @@ describe("periodic compression", () => {
     await equal.agent.respond(question);
     expect(equal.calls).toHaveLength(3);
   });
+});
+
+it("uses full history by default beyond the compression threshold and keeps it after reset", async () => {
+  const { client, calls } = fakeClient(Array.from({ length: 17 }, () => ({ totalTokens: 2 })));
+  const save = vi.fn<HistoryRepository["save"]>();
+  const agent = new Agent({ client, config: DEFAULT_AGENT_CONFIG, historyRepository: { load: () => null, save } });
+  for (let turn = 1; turn <= 16; turn++) {
+    const result = await agent.respond(`question ${turn}`);
+    expect(result.usage.summaryCall).toBeNull();
+    expect(result.usage.factsCall).toBeNull();
+    expect(calls[turn - 1]!.messages).toHaveLength(turn * 2);
+  }
+  expect(calls).toHaveLength(16);
+  expect((save.mock.lastCall![0] as CompressionState).messages).toHaveLength(32);
+  expect(agent.getContextStatus()).toEqual({ strategy: null, activeBranch: null });
+  agent.reset();
+  expect(save).toHaveBeenLastCalledWith({ kind: "compression", summary: null, messages: [] });
+  const fresh = await agent.respond("fresh");
+  expect(fresh.usage.session.totalTokens).toBe(2);
+  expect(fresh.usage.summaryCall).toBeNull();
+  expect(calls[16]!.messages).toHaveLength(2);
 });

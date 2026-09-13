@@ -14,5 +14,5 @@
     // Node поддерживает только синтаксис TypeScript, который можно удалить без преобразования.
     "erasableSyntaxOnly": true
   },
-  "include": ["src", "tests", "vitest.config.ts"]
+  "include": ["src", "tests", "scripts", "vitest.config.ts"]
 }

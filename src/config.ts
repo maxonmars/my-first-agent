@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { AgentConfig } from "./agent.ts";
+import { CONTEXT_STRATEGIES } from "./history.ts";
 
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 
@@ -14,7 +15,7 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = Object.freeze({
   stopMarker: null,
   temperature: null,
   thinkingEnabled: true,
-  historyCompressionEnabled: true,
+  contextStrategy: null,
   historyKeepLastMessages: 10,
 });
 
@@ -23,14 +24,17 @@ const API_KEY_MESSAGE = "Нет DEEPSEEK_API_KEY. Скопируй .env.example 
 const EnvSchema = z.object({
   DEEPSEEK_API_KEY: z.string(API_KEY_MESSAGE).trim().min(1, API_KEY_MESSAGE),
   DEEPSEEK_MODEL: z.string().optional(),
-  AGENT_HISTORY_COMPRESSION: z
+  AGENT_CONTEXT_STRATEGY: z
     .string()
     .optional()
-    .transform((value) => value?.trim() || "true")
-    .refine((value) => value === "true" || value === "false", {
-      message: "AGENT_HISTORY_COMPRESSION должен быть true или false.",
-    })
-    .transform((value) => value === "true"),
+    .transform((value) => value?.trim() || null)
+    .pipe(
+      z
+        .enum(CONTEXT_STRATEGIES, {
+          error: "AGENT_CONTEXT_STRATEGY должен быть пустым, compression, sliding, facts или branching.",
+        })
+        .nullable(),
+    ),
   AGENT_KEEP_LAST_MESSAGES: z
     .string()
     .optional()
@@ -72,7 +76,7 @@ export function readConfig(): AppConfig {
       ...DEFAULT_AGENT_CONFIG,
       model,
       maxInputTokens: result.data.AGENT_MAX_INPUT_TOKENS,
-      historyCompressionEnabled: result.data.AGENT_HISTORY_COMPRESSION,
+      contextStrategy: result.data.AGENT_CONTEXT_STRATEGY,
       historyKeepLastMessages: result.data.AGENT_KEEP_LAST_MESSAGES,
     },
   };

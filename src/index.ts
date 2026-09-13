@@ -17,7 +17,14 @@ try {
   const agent = new Agent({
     client: client.chat.completions,
     config: config.agent,
-    historyRepository: new JsonHistoryRepository(resolve(process.cwd(), ".agent-history.json")),
+    historyRepository: new JsonHistoryRepository(
+      resolve(
+        process.cwd(),
+        config.agent.contextStrategy === null || config.agent.contextStrategy === "compression"
+          ? ".agent-history.json"
+          : `.agent-history.${config.agent.contextStrategy}.json`,
+      ),
+    ),
   });
 
   process.exitCode = await runCli(agent, process.argv.slice(2), { input: stdin, output: stdout, error: stderr });

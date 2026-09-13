@@ -13,6 +13,7 @@ function result(text: string, options: { valid?: boolean; total?: number } = {})
     validation: options.valid === false ? { ok: false, reason: "нарушен контракт" } : { ok: true },
     tokenEstimate: { questionTokens: 2, contextTokens: 30 },
     usage: {
+      factsCall: null,
       summaryCall: null,
       finalCall: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: 7 },
       turn: { promptTokens: 4, completionTokens: 3, reasoningTokens: 2, totalTokens: total },
@@ -61,7 +62,15 @@ function fakeAgent(replies: Array<AgentResult | Error>): AgentPort & {
   });
   const reset = vi.fn<AgentPort["reset"]>();
 
-  return { respond, reset };
+  return {
+    respond,
+    reset,
+    getContextStatus: () => ({ strategy: "sliding", activeBranch: null }),
+    createCheckpoint: vi.fn(),
+    createBranch: vi.fn(),
+    switchBranch: vi.fn(),
+    listBranches: vi.fn(() => [{ name: "main", active: true, messageCount: 0 }]),
+  };
 }
 
 describe("one-shot CLI", () => {
@@ -163,10 +172,60 @@ it("warns about length without reporting input overflow", async () => {
   expect(streams.error()).toBe("");
 });
 
-it("prints provider summary usage separately from estimates", async () => {
+it("prints provider facts usage separately from estimates", async () => {
+  const response = result("answer");
+  response.usage.factsCall = { promptTokens: 12, completionTokens: 3, reasoningTokens: 0, totalTokens: 15 };
+  const streams = capture();
+  expect(await runCli(fakeAgent([response]), ["question"], streams.io)).toBe(0);
+  expect(streams.output()).toContain("API, facts: вход 12, генерация 3, всего 15");
+});
+
+it("dispatches branch commands locally, lists the active branch and keeps dialog input separate", async () => {
+  const agent = fakeAgent([result("answer")]);
+  agent.getContextStatus = () => ({ strategy: "branching", activeBranch: "main" });
+  agent.listBranches = () => [
+    { name: "main", active: false, messageCount: 2 },
+    { name: "a", active: true, messageCount: 4 },
+  ];
+  const streams = capture("/checkpoint\n/branch a\n/switch main\n/branches\nquestion\n/exit\n");
+  await runCli(agent, [], streams.io);
+  expect(agent.createCheckpoint).toHaveBeenCalledOnce();
+  expect(agent.createBranch).toHaveBeenCalledWith("a");
+  expect(agent.switchBranch).toHaveBeenCalledWith("main");
+  expect(agent.respond).toHaveBeenCalledExactlyOnceWith("question");
+  expect(streams.output()).toContain("Контекст: branching, ветка: main");
+  expect(streams.output()).toContain("- main: 2 сообщений");
+  expect(streams.output()).toContain("* a: 4 сообщений");
+  expect(streams.error()).toBe("");
+});
+
+it.each(["/checkpoint extra", "/branch", "/branch a b", "/switch", "/switch a b", "/branches extra", "/unknown"])(
+  "reports malformed command %s without calling the LLM",
+  async (command) => {
+    const agent = fakeAgent([]);
+    const streams = capture(`${command}\n/exit\n`);
+    await runCli(agent, [], streams.io);
+    expect(streams.error()).toContain("Команда не выполнена:");
+    expect(agent.respond).not.toHaveBeenCalled();
+  },
+);
+
+it("reports branch save failure without claiming success and continues", async () => {
+  const agent = fakeAgent([result("answer")]);
+  agent.createCheckpoint = () => {
+    throw new Error("disk");
+  };
+  const streams = capture("/checkpoint\nquestion\n/exit\n");
+  await runCli(agent, [], streams.io);
+  expect(streams.error()).toBe("Команда не выполнена: disk\n");
+  expect(streams.output()).not.toContain("Checkpoint сохранён");
+  expect(agent.respond).toHaveBeenCalledExactlyOnceWith("question");
+});
+
+it("prints summary usage in the compression mode", async () => {
   const response = result("answer");
   response.usage.summaryCall = { promptTokens: 12, completionTokens: 3, reasoningTokens: 0, totalTokens: 15 };
   const streams = capture();
-  expect(await runCli(fakeAgent([response]), ["question"], streams.io)).toBe(0);
+  await runCli(fakeAgent([response]), ["question"], streams.io);
   expect(streams.output()).toContain("API, summary: вход 12, генерация 3, всего 15");
 });
