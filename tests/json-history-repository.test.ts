@@ -52,6 +52,14 @@ describe("JSON history repository", () => {
     expect(readdirSync(directory)).toEqual([]);
   });
 
+  it("loads legacy facts with Cyrillic keys without rewriting the file", () => {
+    const state = { kind: "facts", messages: [], facts: { код_разговора: "КЕДР" } };
+    const source = JSON.stringify(state);
+    writeFileSync(filePath, source);
+    expect(repository.load()).toEqual(state);
+    expect(readFileSync(filePath, "utf8")).toBe(source);
+  });
+
   it("saves UTF-8 JSON with indentation and reloads Unicode and whitespace unchanged", () => {
     repository.save({ kind: "sliding", messages: originalHistory });
 

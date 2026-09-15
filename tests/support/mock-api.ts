@@ -1,4 +1,10 @@
 import { deepStrictEqual } from "node:assert/strict";
+import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, WORKING_MEMORY_TITLE } from "../../src/memory.ts";
+
+const memoryBlocks = [
+  { role: "user", content: `${LONG_TERM_MEMORY_TITLE}\n{"transport":"предпочитаю поезд"}` },
+  { role: "user", content: `${WORKING_MEMORY_TITLE}\n{"goal":"поездка в Казань","budget":"30000 рублей"}` },
+];
 
 globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = input instanceof Request ? input.url : String(input);
@@ -87,6 +93,20 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
       ]).flat(),
     );
     content = "Окно восстановлено.";
+  }
+
+  if (question === "Проверь слои памяти") {
+    if (!request.messages[0]?.content.endsWith(MEMORY_INSTRUCTION)) throw new Error("Нет инструкции памяти");
+    deepStrictEqual(request.messages.slice(1, -1), [
+      ...memoryBlocks,
+      { role: "user", content: "Код разговора — КЕДР" },
+      { role: "assistant", content: "Эхо: Код разговора — КЕДР" },
+    ]);
+    content = "Слои памяти получены.";
+  }
+  if (question === "Проверь память после сброса" || question === "Проверь память в branching") {
+    deepStrictEqual(request.messages.slice(1, -1), memoryBlocks);
+    content = question.endsWith("branching") ? "Branching получил общую память." : "Память сохранилась без диалога.";
   }
 
   if (question === "Как меня зовут?") {

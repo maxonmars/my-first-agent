@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 const mockApi = fileURLToPath(new URL("./support/mock-api.ts", import.meta.url));
 let workingDirectory: string;
 let historyPath: string;
+const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.";
 
 beforeEach(() => {
   workingDirectory = mkdtempSync(join(tmpdir(), "my-first-agent-e2e-"));
@@ -99,7 +100,7 @@ describe("CLI process", () => {
     const first = runProcess([], "Меня зовут Максим\n/reset\n/exit\n", mockEnvironment());
 
     expect(first.status).toBe(0);
-    expect(first.stdout).toContain("Контекст и статистика агента очищены.");
+    expect(first.stdout).toContain(RESET_MESSAGE);
     expect(first.stderr).toBe("");
     expect(readHistory()).toEqual({ kind: "sliding", messages: [] });
 
@@ -142,7 +143,7 @@ it("blocks growing history locally and recovers through interactive reset", () =
   expect(result.stdout).toContain("новый вопрос ≈ 1, весь стек ≈ 17");
   expect(result.stderr).toContain("≈ 21 токенов превышает установленный лимит 17");
   expect(result.stdout).toContain("ход 8, сессия 16");
-  expect(result.stdout.split("Контекст и статистика агента очищены.")[1]).toContain("ход 8, сессия 8");
+  expect(result.stdout.split(RESET_MESSAGE)[1]).toContain("ход 8, сессия 8");
   expect(readHistory()).toEqual({
     kind: "sliding",
     messages: [
@@ -281,4 +282,86 @@ it("continues a legacy array with no strategy and keeps the whole history", () =
   expect(result.stdout).toContain("Вас зовут Максим.");
   expect(JSON.parse(readFileSync(legacyPath, "utf8"))).toMatchObject({ summary: null, messages: expect.any(Array) });
   expect(JSON.parse(readFileSync(legacyPath, "utf8")).messages).toHaveLength(4);
+});
+
+it("persists explicit memory across processes, keeps it after reset and shares it with another strategy", () => {
+  const env = mockEnvironment();
+  const workingPath = join(workingDirectory, ".agent-memory.working.json");
+  const longPath = join(workingDirectory, ".agent-memory.long-term.json");
+  const first = runProcess(
+    [],
+    "/memory set working goal поездка в Казань\n/memory set working budget 30000 рублей\n" +
+      "/memory set long transport предпочитаю поезд\nКод разговора — КЕДР\n/memory\n/exit\n",
+    env,
+  );
+  expect(first.status).toBe(0);
+  expect(first.stderr).toBe("");
+  expect(first.stdout).toContain("Запись «transport» сохранена в long.");
+  expect(first.stdout).toContain("ход 8, сессия 8");
+  const shown = first.stdout.slice(first.stdout.indexOf("Краткосрочная память (short)"));
+  const [shortLayer, dictionaries] = shown.split("Рабочая память (working)");
+  expect(shortLayer).toContain("КЕДР");
+  expect(dictionaries).not.toContain("КЕДР");
+  expect(dictionaries).toContain('"budget": "30000 рублей"');
+  expect(JSON.parse(readFileSync(workingPath, "utf8"))).toEqual({ goal: "поездка в Казань", budget: "30000 рублей" });
+  expect(JSON.parse(readFileSync(longPath, "utf8"))).toEqual({ transport: "предпочитаю поезд" });
+  const workingSource = readFileSync(workingPath, "utf8");
+  const longSource = readFileSync(longPath, "utf8");
+
+  const restored = runProcess(["Проверь слои памяти"], undefined, env);
+  expect(restored.status).toBe(0);
+  expect(restored.stderr).toBe("");
+  expect(restored.stdout).toContain("Слои памяти получены.");
+  expect(restored.stdout).toContain("ход 8, сессия 8");
+
+  const reset = runProcess([], "/reset\n/exit\n", env);
+  expect(reset.status).toBe(0);
+  expect(reset.stdout).toContain(RESET_MESSAGE);
+  expect(readHistory()).toEqual({ kind: "sliding", messages: [] });
+
+  const afterReset = runProcess(["Проверь память после сброса"], undefined, env);
+  expect(afterReset.status).toBe(0);
+  expect(afterReset.stderr).toBe("");
+  expect(afterReset.stdout).toContain("Память сохранилась без диалога.");
+  const slidingSource = readFileSync(historyPath, "utf8");
+
+  const branching = runProcess(["Проверь память в branching"], undefined, {
+    ...env,
+    AGENT_CONTEXT_STRATEGY: "branching",
+  });
+  expect(branching.status).toBe(0);
+  expect(branching.stderr).toBe("");
+  expect(branching.stdout).toContain("Branching получил общую память.");
+  expect(readFileSync(historyPath, "utf8")).toBe(slidingSource);
+  expect(
+    JSON.parse(readFileSync(join(workingDirectory, ".agent-history.branching.json"), "utf8")).branches.main,
+  ).toHaveLength(2);
+  expect(readFileSync(workingPath, "utf8")).toBe(workingSource);
+  expect(readFileSync(longPath, "utf8")).toBe(longSource);
+});
+
+it("rejects one-shot memory commands and stops on corrupted memory without exposing it", () => {
+  const env = mockEnvironment();
+  const workingPath = join(workingDirectory, ".agent-memory.working.json");
+  const longPath = join(workingDirectory, ".agent-memory.long-term.json");
+
+  const command = runProcess(["/memory", "set", "working", "goal", "поездка"], undefined, env);
+  expect(command.status).toBe(1);
+  expect(command.stderr).toBe("Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n");
+  expect(existsSync(workingPath)).toBe(false);
+  expect(existsSync(historyPath)).toBe(false);
+
+  const corrupted = '{"transport":42,"note":"личное предпочтение"}';
+  writeFileSync(longPath, corrupted, "utf8");
+  const result = runProcess(["вопрос"], undefined, env);
+  expect(result.status).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toMatch(/^Не удалось загрузить память long из «/);
+  expect(result.stderr).toContain(longPath);
+  expect(result.stderr).toMatch(
+    /»: неверная структура памяти, значение записи должно быть строкой, получено number\.\n$/,
+  );
+  expect(result.stderr).not.toContain("личное");
+  expect(readFileSync(longPath, "utf8")).toBe(corrupted);
+  expect(existsSync(historyPath)).toBe(false);
 });

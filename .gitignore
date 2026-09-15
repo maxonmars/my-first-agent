@@ -12,5 +12,11 @@ coverage/
 .agent-history.*.json
 .agent-history.*.json.*.tmp
 
+# Рабочая и долговременная память и временные файлы записи.
+.agent-memory.working.json
+.agent-memory.working.json.*.tmp
+.agent-memory.long-term.json
+.agent-memory.long-term.json.*.tmp
+
 # macOS
 .DS_Store

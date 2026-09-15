@@ -5,6 +5,7 @@ import { Agent } from "./agent.ts";
 import { runCli } from "./cli.ts";
 import { DEEPSEEK_BASE_URL, readConfig } from "./config.ts";
 import { JsonHistoryRepository } from "./json-history-repository.ts";
+import { JsonMemoryRepository } from "./json-memory-repository.ts";
 
 try {
   const config = readConfig();
@@ -25,6 +26,8 @@ try {
           : `.agent-history.${config.agent.contextStrategy}.json`,
       ),
     ),
+    workingMemoryRepository: new JsonMemoryRepository(resolve(process.cwd(), ".agent-memory.working.json"), "working"),
+    longTermMemoryRepository: new JsonMemoryRepository(resolve(process.cwd(), ".agent-memory.long-term.json"), "long"),
   });
 
   process.exitCode = await runCli(agent, process.argv.slice(2), { input: stdin, output: stdout, error: stderr });

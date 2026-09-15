@@ -1,8 +1,7 @@
-import { randomUUID } from "node:crypto";
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import { factsSchema } from "./facts.ts";
 import type { HistoryRepository, HistoryState } from "./history.ts";
+import { readTextFile, replaceFile } from "./json-file.ts";
 
 const historySchema = z.array(
   z.strictObject({
@@ -31,17 +30,6 @@ const stateSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
-function errorCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
-    ? error.code
-    : undefined;
-}
-
-function failureReason(operation: string, error: unknown): string {
-  const code = errorCode(error);
-  return code ? `${operation} (${code})` : operation;
-}
-
 export class JsonHistoryRepository implements HistoryRepository {
   private readonly filePath: string;
 
@@ -50,15 +38,8 @@ export class JsonHistoryRepository implements HistoryRepository {
   }
 
   load(): HistoryState | null {
-    let source: string;
-    try {
-      source = readFileSync(this.filePath, "utf8");
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return null;
-      throw new Error(
-        `Не удалось загрузить историю из «${this.filePath}»: ${failureReason("ошибка чтения файла", error)}.`,
-      );
-    }
+    const source = readTextFile(this.filePath, `Не удалось загрузить историю из «${this.filePath}»`);
+    if (source === null) return null;
 
     let parsed: unknown;
     try {
@@ -103,27 +84,14 @@ export class JsonHistoryRepository implements HistoryRepository {
 
   save(state: HistoryState): void {
     const validated = this.validateState(state, "сохранить");
-    const temporaryPath = `${this.filePath}.${randomUUID()}.tmp`;
-    let operation = "ошибка записи временного файла";
-    try {
-      writeFileSync(
-        temporaryPath,
-        JSON.stringify(
-          validated.kind === "compression" ? { summary: validated.summary, messages: validated.messages } : validated,
-          null,
-          2,
-        ),
-        { encoding: "utf8", flag: "wx" },
-      );
-      operation = "ошибка замены файла";
-      renameSync(temporaryPath, this.filePath);
-    } catch (error) {
-      try {
-        unlinkSync(temporaryPath);
-      } catch {
-        // Очистка временного файла выполняется по возможности.
-      }
-      throw new Error(`Не удалось сохранить историю в «${this.filePath}»: ${failureReason(operation, error)}.`);
-    }
+    replaceFile(
+      this.filePath,
+      JSON.stringify(
+        validated.kind === "compression" ? { summary: validated.summary, messages: validated.messages } : validated,
+        null,
+        2,
+      ),
+      `Не удалось сохранить историю в «${this.filePath}»`,
+    );
   }
 }

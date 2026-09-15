@@ -46,9 +46,15 @@ function capture(input = ""): { io: CliIo; output: () => string; error: () => st
   };
 }
 
+const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.";
+
 function fakeAgent(replies: Array<AgentResult | Error>): AgentPort & {
   respond: ReturnType<typeof vi.fn<AgentPort["respond"]>>;
   reset: ReturnType<typeof vi.fn<AgentPort["reset"]>>;
+  getMemory: ReturnType<typeof vi.fn<AgentPort["getMemory"]>>;
+  setMemory: ReturnType<typeof vi.fn<AgentPort["setMemory"]>>;
+  deleteMemory: ReturnType<typeof vi.fn<AgentPort["deleteMemory"]>>;
+  clearMemory: ReturnType<typeof vi.fn<AgentPort["clearMemory"]>>;
 } {
   let index = 0;
   const respond = vi.fn<AgentPort["respond"]>(async () => {
@@ -66,6 +72,14 @@ function fakeAgent(replies: Array<AgentResult | Error>): AgentPort & {
     respond,
     reset,
     getContextStatus: () => ({ strategy: "sliding", activeBranch: null }),
+    getMemory: vi.fn<AgentPort["getMemory"]>(() => ({
+      short: { kind: "sliding", messages: [] },
+      working: {},
+      long: {},
+    })),
+    setMemory: vi.fn<AgentPort["setMemory"]>(),
+    deleteMemory: vi.fn<AgentPort["deleteMemory"]>(() => true),
+    clearMemory: vi.fn<AgentPort["clearMemory"]>(),
     createCheckpoint: vi.fn(),
     createBranch: vi.fn(),
     switchBranch: vi.fn(),
@@ -121,7 +135,9 @@ describe("interactive CLI", () => {
     expect(code).toBe(0);
     expect(agent.respond.mock.calls).toEqual([["первый вопрос"], ["второй вопрос"]]);
     expect(agent.reset).toHaveBeenCalledOnce();
-    expect(streams.output()).toContain("Контекст и статистика агента очищены.");
+    expect(streams.output()).toContain(RESET_MESSAGE);
+    expect(streams.output()).toContain("/memory set working|long ключ значение");
+    expect(streams.output()).toContain("Новая задача: /reset, затем /memory clear working.");
   });
 
   it("continues the dialog after an agent error", async () => {
@@ -147,7 +163,7 @@ describe("interactive CLI", () => {
     expect(code).toBe(0);
     expect(agent.reset).toHaveBeenCalledOnce();
     expect(streams.error()).toBe("Не удалось сбросить контекст: Не удалось сохранить историю: EACCES.\n");
-    expect(streams.output()).not.toContain("Контекст и статистика агента очищены.");
+    expect(streams.output()).not.toContain(RESET_MESSAGE);
     expect(agent.respond).toHaveBeenCalledWith("следующий вопрос");
     expect(streams.output()).toContain("ответ после ошибки сброса");
   });
@@ -228,4 +244,135 @@ it("prints summary usage in the compression mode", async () => {
   const streams = capture();
   await runCli(fakeAgent([response]), ["question"], streams.io);
   expect(streams.output()).toContain("API, summary: вход 12, генерация 3, всего 15");
+});
+
+describe("memory commands", () => {
+  function expectNoAgentCalls(agent: ReturnType<typeof fakeAgent>): void {
+    for (const method of [agent.respond, agent.reset, agent.setMemory, agent.deleteMemory, agent.clearMemory]) {
+      expect(method).not.toHaveBeenCalled();
+    }
+  }
+
+  it("passes the whole multi-word value, keeps key and value case and reports success after the write", async () => {
+    const agent = fakeAgent([]);
+    const streams = capture(
+      "/memory set working goal  поездка в  Казань \n/MEMORY SET Long Transport Предпочитаю Поезд\n/exit\n",
+    );
+
+    await runCli(agent, [], streams.io);
+
+    expect(agent.setMemory.mock.calls).toEqual([
+      ["working", "goal", "поездка в  Казань"],
+      ["long", "Transport", "Предпочитаю Поезд"],
+    ]);
+    expect(streams.output()).toContain("Запись «goal» сохранена в working.");
+    expect(streams.output()).toContain("Запись «Transport» сохранена в long.");
+    expect(agent.respond).not.toHaveBeenCalled();
+    expect(streams.error()).toBe("");
+  });
+
+  it("shows all layers or one layer, deletes and clears through the agent port", async () => {
+    const agent = fakeAgent([]);
+    agent.getMemory.mockReturnValue({
+      short: {
+        kind: "sliding",
+        messages: [
+          { role: "user", content: "Код — КЕДР" },
+          { role: "assistant", content: "Принято" },
+        ],
+      },
+      working: { goal: "поездка в Казань" },
+      long: { transport: "предпочитаю поезд" },
+    });
+    agent.deleteMemory.mockReturnValueOnce(true).mockReturnValueOnce(false);
+    const streams = capture(
+      "/memory\n/memory show WORKING\n/memory delete long transport\n/memory delete long transport\n" +
+        "/memory clear working\n/memory clear short\n/exit\n",
+    );
+
+    await runCli(agent, [], streams.io);
+
+    const [all, rest] = streams.output().split("Запись «transport» удалена из long.");
+    const shortAt = all!.indexOf("Краткосрочная память (short)");
+    const workingAt = all!.indexOf("Рабочая память (working)");
+    const longAt = all!.indexOf("Долговременная память (long)");
+    expect(shortAt).toBeGreaterThan(-1);
+    expect(shortAt).toBeLessThan(workingAt);
+    expect(workingAt).toBeLessThan(longAt);
+    expect(all!.slice(shortAt, workingAt)).toContain('"content": "Код — КЕДР"');
+    expect(all!.slice(workingAt, longAt)).toContain('"goal": "поездка в Казань"');
+    expect(all!.slice(longAt)).toContain('"transport": "предпочитаю поезд"');
+    expect(all!.slice(longAt).split("Рабочая память (working)")[1]).not.toContain("Долговременная память");
+    expect(rest).toContain("Запись «transport» не найдена в long.");
+    expect(rest).toContain("Слой working очищен.");
+    expect(rest).toContain(RESET_MESSAGE);
+    expect(agent.deleteMemory.mock.calls).toEqual([
+      ["long", "transport"],
+      ["long", "transport"],
+    ]);
+    expect(agent.clearMemory.mock.calls).toEqual([["working"], ["short"]]);
+    expect(agent.respond).not.toHaveBeenCalled();
+    expect(agent.reset).not.toHaveBeenCalled();
+    expect(streams.error()).toBe("");
+  });
+
+  it.each([
+    ["/memory list", "Неизвестное действие памяти «list»"],
+    ["/memory show", "Не указан слой памяти"],
+    ["/memory show all", "Неизвестный слой памяти «all»"],
+    ["/memory show working extra", "Лишние аргументы"],
+    ["/memory set working", "Не хватает аргументов"],
+    ["/memory set working goal", "Не хватает аргументов"],
+    ["/memory set short goal значение", "Слой short изменяется только диалогом"],
+    ["/memory delete long", "Не хватает аргументов"],
+    ["/memory delete long a b", "Лишние аргументы"],
+    ["/memory delete short goal", "Слой short изменяется только диалогом"],
+    ["/memory clear", "Не указан слой памяти"],
+    ["/memory clear all", "Неизвестный слой памяти «all»"],
+    ["/memory clear working now", "Лишние аргументы"],
+  ])("reports %s with the reason and syntax without calling the agent", async (command, reason) => {
+    const agent = fakeAgent([]);
+    const streams = capture(`${command}\n/exit\n`);
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.error()).toContain(`Команда не выполнена: ${reason}`);
+    expect(streams.error()).toContain("Использование: /memory");
+    expect(agent.getMemory).not.toHaveBeenCalled();
+    expectNoAgentCalls(agent);
+  });
+
+  it("reports memory write failures without a false success and continues", async () => {
+    const agent = fakeAgent([result("ответ")]);
+    agent.setMemory.mockImplementationOnce(() => {
+      throw new Error("Не удалось сохранить память working: ENOSPC.");
+    });
+    agent.clearMemory.mockImplementationOnce(() => {
+      throw new Error("disk");
+    });
+    const streams = capture("/memory set working goal поездка\n/memory clear short\nвопрос\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.error()).toBe(
+      "Команда не выполнена: Не удалось сохранить память working: ENOSPC.\nКоманда не выполнена: disk\n",
+    );
+    expect(streams.output()).not.toContain("сохранена в working");
+    expect(streams.output()).not.toContain(RESET_MESSAGE);
+    expect(agent.respond).toHaveBeenCalledExactlyOnceWith("вопрос");
+  });
+
+  it.each([["/memory", "show"], ["/reset"], [" /memory set working goal поездка"]])(
+    "rejects one-shot command %j without calling the model",
+    async (...args) => {
+      const agent = fakeAgent([]);
+      const streams = capture();
+
+      expect(await runCli(agent, args, streams.io)).toBe(1);
+
+      expect(streams.error()).toBe("Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n");
+      expect(agent.getMemory).not.toHaveBeenCalled();
+      expectNoAgentCalls(agent);
+    },
+  );
 });
