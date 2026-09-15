@@ -1,4 +1,4 @@
-import { FACTS_INSTRUCTION, FACTS_MAX_TOKENS, factsSchema } from "./facts.ts";
+import { FACTS_INSTRUCTION, FACTS_MAX_TOKENS, factsResponseSchema } from "./facts.ts";
 import { FORMATS, type FormatName, type ValidationResult } from "./formats.ts";
 import {
   type BranchingHistory,
@@ -11,6 +11,18 @@ import {
   type HistoryState,
 } from "./history.ts";
 import type { DeepSeekParams, LlmClient, LlmCompletion } from "./llm-client.ts";
+import {
+  LONG_TERM_MEMORY_TITLE,
+  MEMORY_INSTRUCTION,
+  MEMORY_KEY_PATTERN,
+  MEMORY_KEY_RULE,
+  type MemoryEntries,
+  type MemoryLayer,
+  type MemoryRepository,
+  type MemorySnapshot,
+  WORKING_MEMORY_TITLE,
+  type WritableMemoryLayer,
+} from "./memory.ts";
 import { META_INSTRUCTION, STRATEGIES, type StrategyName } from "./strategies.ts";
 import { estimateContextTokens, estimateTextTokens } from "./tokens.ts";
 
@@ -57,6 +69,8 @@ export interface AgentOptions {
   client: LlmClient;
   config: AgentConfig;
   historyRepository?: HistoryRepository;
+  workingMemoryRepository?: MemoryRepository;
+  longTermMemoryRepository?: MemoryRepository;
 }
 
 type PreparedParams = DeepSeekParams & {
@@ -70,10 +84,13 @@ interface CompletionResult {
   usage: TokenUsage;
 }
 
+type WritableMemory = Record<WritableMemoryLayer, MemoryEntries>;
+
 interface TurnContext {
   messages: HistoryMessage[];
   facts: Facts | null;
   summary: string | null;
+  memory: WritableMemory;
 }
 
 export interface ContextStatus {
@@ -92,12 +109,15 @@ export class AgentResponseError extends Error {}
 export class AgentBusyError extends Error {}
 export class AgentContextLimitError extends Error {}
 export class AgentBranchError extends Error {}
+export class AgentMemoryError extends Error {}
 
 export class Agent {
   private readonly client: LlmClient;
   private readonly config: Readonly<AgentConfig>;
   private readonly historyRepository: HistoryRepository | undefined;
+  private readonly memoryRepositories: Record<WritableMemoryLayer, MemoryRepository | undefined>;
   private history: HistoryState;
+  private memory: WritableMemory;
   private sessionUsage: TokenUsage = emptyUsage();
   private busy = false;
 
@@ -110,6 +130,11 @@ export class Agent {
     if (this.history.kind !== (this.config.contextStrategy ?? "compression")) {
       throw new AgentConfigError("Стратегия сохранённой истории не совпадает с contextStrategy.");
     }
+    this.memoryRepositories = { working: options.workingMemoryRepository, long: options.longTermMemoryRepository };
+    this.memory = {
+      working: structuredClone(this.memoryRepositories.working?.load() ?? {}),
+      long: structuredClone(this.memoryRepositories.long?.load() ?? {}),
+    };
   }
 
   async respond(input: string): Promise<AgentResult> {
@@ -183,7 +208,7 @@ export class Agent {
         } catch {
           throw new AgentResponseError("Ошибка обновления facts: некорректный JSON.");
         }
-        const result = factsSchema.safeParse(parsed);
+        const result = factsResponseSchema.safeParse(parsed);
         if (!result.success) {
           throw new AgentResponseError(`Ошибка обновления facts: ${result.error.issues[0]!.message}.`);
         }
@@ -247,6 +272,33 @@ export class Agent {
     this.sessionUsage = emptyUsage();
   }
 
+  getMemory(): MemorySnapshot {
+    return { short: structuredClone(this.history), ...structuredClone(this.memory) };
+  }
+
+  setMemory(layer: WritableMemoryLayer, key: string, value: string): void {
+    const entries = this.memoryCandidate(layer, key);
+    const trimmed = value.trim();
+    if (trimmed.length === 0) throw new AgentMemoryError("Значение записи памяти не должно быть пустым.");
+    this.commitMemory(layer, { ...entries, [key]: trimmed });
+  }
+
+  deleteMemory(layer: WritableMemoryLayer, key: string): boolean {
+    const entries = this.memoryCandidate(layer, key);
+    if (!Object.hasOwn(entries, key)) return false;
+    this.commitMemory(layer, Object.fromEntries(Object.entries(entries).filter(([name]) => name !== key)));
+    return true;
+  }
+
+  clearMemory(layer: MemoryLayer): void {
+    if (layer === "short") {
+      this.reset();
+      return;
+    }
+    this.memoryCandidate(layer);
+    this.commitMemory(layer, {});
+  }
+
   getContextStatus(): ContextStatus {
     return {
       strategy: this.config.contextStrategy,
@@ -306,21 +358,40 @@ export class Agent {
     this.history = state;
   }
 
+  private memoryCandidate(layer: WritableMemoryLayer, key?: string): MemoryEntries {
+    if (this.busy) throw new AgentBusyError("Нельзя менять память во время обработки запроса.");
+    if (layer !== "working" && layer !== "long") {
+      throw new AgentMemoryError(`Слой памяти ${layer} недоступен для записи: используйте working или long.`);
+    }
+    if (key !== undefined && !MEMORY_KEY_PATTERN.test(key)) {
+      throw new AgentMemoryError(`Ключ памяти: ${MEMORY_KEY_RULE}.`);
+    }
+    return this.memory[layer];
+  }
+
+  private commitMemory(layer: WritableMemoryLayer, entries: MemoryEntries): void {
+    this.memoryRepositories[layer]?.save(structuredClone(entries));
+    this.memory = { ...this.memory, [layer]: entries };
+  }
+
   private turnContext(): TurnContext {
+    const memory = structuredClone(this.memory);
     if (this.history.kind === "branching") {
       return {
         messages: structuredClone(this.history.branches[this.history.activeBranch]!),
         facts: null,
         summary: null,
+        memory,
       };
     }
     if (this.history.kind === "compression") {
-      return { messages: structuredClone(this.history.messages), summary: this.history.summary, facts: null };
+      return { messages: structuredClone(this.history.messages), summary: this.history.summary, facts: null, memory };
     }
     return {
       summary: null,
       messages: structuredClone(this.history.messages.slice(-this.config.historyKeepLastMessages)),
       facts: this.history.kind === "facts" ? { ...this.history.facts } : null,
+      memory,
     };
   }
 
@@ -342,7 +413,9 @@ export class Agent {
         `Этап «${stage}»: оценка входного контекста ≈ ${contextTokens} токенов превышает установленный лимит ${this.config.maxInputTokens}. ` +
           (stage === "обновление facts" || stage === "суммаризация"
             ? "Увеличьте maxInputTokens или очистите историю командой /reset."
-            : "Сократите вопрос или очистите историю командой /reset."),
+            : hasMemory(this.memory)
+              ? "Сократите вопрос или очистите историю командой /reset. Рабочая и долговременная память тоже входят в запрос, а /reset их сохраняет: при необходимости сократите их командами /memory delete или /memory clear."
+              : "Сократите вопрос или очистите историю командой /reset."),
       );
     }
 
@@ -370,7 +443,12 @@ export class Agent {
     const params: PreparedParams = {
       model: this.config.model,
       messages: [
-        { role: "system", content: this.buildSystemPrompt(extraInstruction, applyOutputPolicy) },
+        {
+          role: "system",
+          content: this.buildSystemPrompt(extraInstruction, applyOutputPolicy, hasMemory(context.memory)),
+        },
+        ...memoryMessages(LONG_TERM_MEMORY_TITLE, context.memory.long),
+        ...memoryMessages(WORKING_MEMORY_TITLE, context.memory.working),
         ...(context.summary === null
           ? []
           : [
@@ -404,8 +482,8 @@ export class Agent {
     return params;
   }
 
-  private buildSystemPrompt(extraInstruction: string, applyOutputPolicy: boolean): string {
-    const blocks = [this.config.systemPrompt, extraInstruction];
+  private buildSystemPrompt(extraInstruction: string, applyOutputPolicy: boolean, withMemory: boolean): string {
+    const blocks = [this.config.systemPrompt, withMemory ? MEMORY_INSTRUCTION : "", extraInstruction];
 
     if (applyOutputPolicy) {
       blocks.push(FORMATS[this.config.format].instruction);
@@ -462,6 +540,14 @@ function assertPositiveInteger(value: number | null, name: string): void {
   if (value !== null && (!Number.isInteger(value) || value <= 0)) {
     throw new AgentConfigError(`${name} должен быть положительным целым числом.`);
   }
+}
+
+function hasMemory(memory: WritableMemory): boolean {
+  return Object.keys(memory.working).length > 0 || Object.keys(memory.long).length > 0;
+}
+
+function memoryMessages(title: string, entries: MemoryEntries): Array<{ role: "user"; content: string }> {
+  return Object.keys(entries).length === 0 ? [] : [{ role: "user", content: `${title}\n${JSON.stringify(entries)}` }];
 }
 
 function usageOf(response: LlmCompletion): TokenUsage {

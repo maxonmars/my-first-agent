@@ -74,6 +74,30 @@ describe("sliding window", () => {
 });
 
 describe("facts memory", () => {
+  it.each(["код_разговора", "conversation_код", "café", "conversation code", "1code"])(
+    "rejects invalid fact key %s without changing history",
+    async (key) => {
+      const { agent, repository, calls } = setup([{ ...factsReply, content: JSON.stringify({ [key]: "КЕДР" }) }]);
+      await expect(agent.respond("вопрос")).rejects.toThrow("ключ факта должен начинаться с латинской буквы");
+      expect(calls).toHaveLength(1);
+      expect(repository.save).not.toHaveBeenCalled();
+      expect(agent.getMemory().short).toEqual(emptyHistory("facts"));
+    },
+  );
+
+  it("passes legacy keys to extraction and saves renamed keys with original values", async () => {
+    const { agent, repository, calls } = setup([{ content: '{"conversation_code":"КЕДР"}' }, {}], {
+      kind: "facts",
+      facts: { код_разговора: "КЕДР" },
+      messages: [],
+    });
+    await agent.respond("Какой код?");
+    expect(source(calls[0]!).facts).toEqual({ код_разговора: "КЕДР" });
+    expect(calls[0]!.messages[0]!.content).toContain("Прежние ключи на других языках переименуй");
+    expect(repository.save).toHaveBeenCalledWith(expect.objectContaining({ facts: { conversation_code: "КЕДР" } }));
+    expect(calls[1]!.messages[1]!.content).toContain('{"conversation_code":"КЕДР"}');
+  });
+
   it.each([
     ['{"budget":84000}', "значение факта должно быть строкой, получено number"],
     ['{"email_report":true}', "значение факта должно быть строкой, получено boolean"],
@@ -193,6 +217,7 @@ describe("facts memory", () => {
     { stage: "empty facts", failed: [{ ...factsReply, content: " \n" }], spent: 15 },
     { stage: "truncated facts", failed: [{ ...factsReply, finishReason: "length" }], spent: 15 },
     { stage: "invalid JSON", failed: [{ ...factsReply, content: "{" }], spent: 15 },
+    { stage: "non-Latin key", failed: [{ ...factsReply, content: '{"код":"КЕДР"}' }], spent: 15 },
     { stage: "invalid dictionary", failed: [{ ...factsReply, content: '{"budget":96000}' }], spent: 15 },
     { stage: "array", failed: [{ ...factsReply, content: "[]" }], spent: 15 },
     { stage: "null", failed: [{ ...factsReply, content: "null" }], spent: 15 },
