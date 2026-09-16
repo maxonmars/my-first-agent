@@ -4,8 +4,8 @@ import OpenAI from "openai";
 import { Agent } from "./agent.ts";
 import { runCli } from "./cli.ts";
 import { DEEPSEEK_BASE_URL, readConfig } from "./config.ts";
-import { JsonHistoryRepository } from "./json-history-repository.ts";
-import { JsonMemoryRepository } from "./json-memory-repository.ts";
+import { JsonProfilesRepository } from "./json-profiles-repository.ts";
+import { AgentSession, jsonAgentRepositories } from "./session.ts";
 
 try {
   const config = readConfig();
@@ -15,22 +15,19 @@ try {
     maxRetries: 2,
     timeout: 600_000,
   });
-  const agent = new Agent({
-    client: client.chat.completions,
-    config: config.agent,
-    historyRepository: new JsonHistoryRepository(
-      resolve(
-        process.cwd(),
-        config.agent.contextStrategy === null || config.agent.contextStrategy === "compression"
-          ? ".agent-history.json"
-          : `.agent-history.${config.agent.contextStrategy}.json`,
-      ),
-    ),
-    workingMemoryRepository: new JsonMemoryRepository(resolve(process.cwd(), ".agent-memory.working.json"), "working"),
-    longTermMemoryRepository: new JsonMemoryRepository(resolve(process.cwd(), ".agent-memory.long-term.json"), "long"),
+  const root = process.cwd();
+  const session = new AgentSession({
+    profilesRepository: new JsonProfilesRepository(resolve(root, ".agent-profiles.json")),
+    createAgent: (userId, profileProvider) =>
+      new Agent({
+        client: client.chat.completions,
+        config: config.agent,
+        ...jsonAgentRepositories(root, userId, config.agent.contextStrategy),
+        ...(profileProvider === undefined ? {} : { profileProvider }),
+      }),
   });
 
-  process.exitCode = await runCli(agent, process.argv.slice(2), { input: stdin, output: stdout, error: stderr });
+  process.exitCode = await runCli(session, process.argv.slice(2), { input: stdin, output: stdout, error: stderr });
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;

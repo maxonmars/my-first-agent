@@ -1,10 +1,22 @@
 import { deepStrictEqual } from "node:assert/strict";
 import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, WORKING_MEMORY_TITLE } from "../../src/memory.ts";
+import { PROFILE_INSTRUCTION, PROFILE_TITLE } from "../../src/profile.ts";
 
 const memoryBlocks = [
   { role: "user", content: `${LONG_TERM_MEMORY_TITLE}\n{"transport":"предпочитаю поезд"}` },
   { role: "user", content: `${WORKING_MEMORY_TITLE}\n{"goal":"поездка в Казань","budget":"30000 рублей"}` },
 ];
+
+const profileBlocks = {
+  maks: {
+    role: "user",
+    content: `${PROFILE_TITLE}\n{"style":"На ты, списком","constraints":"Без эмодзи","context":"Backend-разработчик"}`,
+  },
+  vladimir: {
+    role: "user",
+    content: `${PROFILE_TITLE}\n{"style":"На вы, таблицей","context":"Начинающий разработчик"}`,
+  },
+};
 
 globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = input instanceof Request ? input.url : String(input);
@@ -107,6 +119,26 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
   if (question === "Проверь память после сброса" || question === "Проверь память в branching") {
     deepStrictEqual(request.messages.slice(1, -1), memoryBlocks);
     content = question.endsWith("branching") ? "Branching получил общую память." : "Память сохранилась без диалога.";
+  }
+
+  if (question === "Проверь профиль Владимира") {
+    if (!request.messages[0]?.content.endsWith(PROFILE_INSTRUCTION)) throw new Error("Нет инструкции профиля");
+    deepStrictEqual(request.messages.slice(1, -1), [
+      profileBlocks.vladimir,
+      { role: "user", content: "Код Владимира — ДУБ" },
+      { role: "assistant", content: "Эхо: Код Владимира — ДУБ" },
+    ]);
+    content = "Профиль Владимира получен.";
+  }
+  if (question === "Проверь профиль Макса") {
+    if (!request.messages[0]?.content.includes(PROFILE_INSTRUCTION)) throw new Error("Нет инструкции профиля");
+    deepStrictEqual(request.messages.slice(1, 5), [
+      profileBlocks.maks,
+      { role: "user", content: `${LONG_TERM_MEMORY_TITLE}\n{"language":"TypeScript"}` },
+      { role: "user", content: "Код Макса — КЕДР" },
+      { role: "assistant", content: "Эхо: Код Макса — КЕДР" },
+    ]);
+    content = "Профиль Макса получен.";
   }
 
   if (question === "Как меня зовут?") {
