@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 function errorCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
@@ -22,11 +23,13 @@ export function readTextFile(filePath: string, errorPrefix: string): string | nu
   }
 }
 
-/** Пишет временный файл рядом с целевым и атомарно заменяет целевой через renameSync. */
+/** Создаёт каталог при необходимости, пишет временный файл рядом с целевым и заменяет целевой через renameSync. */
 export function replaceFile(filePath: string, content: string, errorPrefix: string): void {
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
-  let operation = "ошибка записи временного файла";
+  let operation = "ошибка создания каталога";
   try {
+    mkdirSync(dirname(filePath), { recursive: true });
+    operation = "ошибка записи временного файла";
     writeFileSync(temporaryPath, content, { encoding: "utf8", flag: "wx" });
     operation = "ошибка замены файла";
     renameSync(temporaryPath, filePath);

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,7 +155,7 @@ it("blocks growing history locally and recovers through interactive reset", () =
   const beforeRefusal = readFileSync(historyPath, "utf8");
   const blocked = runProcess(["x".repeat(100)], undefined, env);
   expect(blocked.status).toBe(1);
-  expect(blocked.stdout).toBe("Контекст: sliding\n");
+  expect(blocked.stdout).toBe("Пользователь: не выбран\nКонтекст: sliding\n");
   expect(blocked.stderr).toContain("превышает установленный лимит 17");
   expect(readFileSync(historyPath, "utf8")).toBe(beforeRefusal);
 });
@@ -364,4 +365,74 @@ it("rejects one-shot memory commands and stops on corrupted memory without expos
   expect(result.stderr).not.toContain("личное");
   expect(readFileSync(longPath, "utf8")).toBe(corrupted);
   expect(existsSync(historyPath)).toBe(false);
+});
+
+it("creates two users, switches between them and restores the selected user's context across processes", () => {
+  const env = mockEnvironment();
+  const userPath = (userId: string, file: string) =>
+    join(workingDirectory, ".agent-users", createHash("sha256").update(userId, "utf8").digest("hex"), file);
+  const readJson = (path: string) => JSON.parse(readFileSync(path, "utf8"));
+
+  const legacy = runProcess(["проверка связи"], undefined, env);
+  expect(legacy.status).toBe(0);
+  expect(legacy.stdout.startsWith("Пользователь: не выбран\nКонтекст: sliding\n")).toBe(true);
+  expect(existsSync(join(workingDirectory, ".agent-profiles.json"))).toBe(false);
+  const legacySource = readFileSync(historyPath, "utf8");
+
+  const first = runProcess(
+    [],
+    "/profile-init\nМакс\nНа ты, списком\nБез эмодзи\nBackend-разработчик\nКод Макса — КЕДР\n" +
+      "/profile-init\nВладимир\nНа вы, таблицей\n\nНачинающий разработчик\nКод Владимира — ДУБ\n/exit\n",
+    env,
+  );
+  expect(first.status).toBe(0);
+  expect(first.stderr).toBe("");
+  expect(first.stdout).toContain("без профиля > Настройка профиля.");
+  expect(first.stdout).toContain("Профиль «Макс» сохранён.\nПользователь: Макс\nКонтекст: sliding\n");
+  expect(first.stdout).toContain("Макс > Эхо: Код Макса — КЕДР");
+  expect(first.stdout).toContain("Владимир > Эхо: Код Владимира — ДУБ");
+  expect(first.stdout.match(/ход 8, сессия 8/g)).toHaveLength(2);
+  expect(readJson(join(workingDirectory, ".agent-profiles.json"))).toEqual({
+    activeUserId: "Владимир",
+    profiles: {
+      Макс: { style: "На ты, списком", constraints: "Без эмодзи", context: "Backend-разработчик" },
+      Владимир: { style: "На вы, таблицей", context: "Начинающий разработчик" },
+    },
+  });
+  expect(readdirSync(join(workingDirectory, ".agent-users"))).toHaveLength(2);
+  expect(readJson(userPath("Макс", ".agent-history.sliding.json")).messages).toEqual([
+    { role: "user", content: "Код Макса — КЕДР" },
+    { role: "assistant", content: "Эхо: Код Макса — КЕДР" },
+  ]);
+  expect(readFileSync(historyPath, "utf8")).toBe(legacySource);
+
+  const second = runProcess(["Проверь профиль Владимира"], undefined, env);
+  expect(second.status).toBe(0);
+  expect(second.stderr).toBe("");
+  expect(second.stdout.startsWith("Пользователь: Владимир\nКонтекст: sliding\n")).toBe(true);
+  expect(second.stdout).toContain("Профиль Владимира получен.");
+
+  const third = runProcess(
+    [],
+    "/profile load Макс\n/memory set long language TypeScript\nПроверь профиль Макса\n/exit\n",
+    env,
+  );
+  expect(third.status).toBe(0);
+  expect(third.stderr).toBe("");
+  expect(third.stdout).toContain("Владимир > Пользователь: Макс\nКонтекст: sliding\nМакс > ");
+  expect(third.stdout).toContain("Профиль Макса получен.");
+  expect(readJson(userPath("Макс", ".agent-memory.long-term.json"))).toEqual({ language: "TypeScript" });
+  expect(existsSync(userPath("Владимир", ".agent-memory.long-term.json"))).toBe(false);
+  expect(existsSync(join(workingDirectory, ".agent-memory.long-term.json"))).toBe(false);
+
+  const fourth = runProcess(["Проверь профиль Макса"], undefined, env);
+  expect(fourth.status).toBe(0);
+  expect(fourth.stderr).toBe("");
+  expect(fourth.stdout.startsWith("Пользователь: Макс\nКонтекст: sliding\n")).toBe(true);
+  expect(fourth.stdout).toContain("Профиль Макса получен.");
+  expect(fourth.stdout).toContain("ход 8, сессия 8");
+  expect(readJson(join(workingDirectory, ".agent-profiles.json")).activeUserId).toBe("Макс");
+  expect(readJson(userPath("Макс", ".agent-history.sliding.json")).messages).toHaveLength(6);
+  expect(readJson(userPath("Владимир", ".agent-history.sliding.json")).messages).toHaveLength(4);
+  expect(readFileSync(historyPath, "utf8")).toBe(legacySource);
 });

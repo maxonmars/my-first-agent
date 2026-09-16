@@ -23,6 +23,13 @@ import {
   WORKING_MEMORY_TITLE,
   type WritableMemoryLayer,
 } from "./memory.ts";
+import {
+  isProfileEmpty,
+  PROFILE_INSTRUCTION,
+  PROFILE_META_INSTRUCTION,
+  PROFILE_TITLE,
+  type UserProfile,
+} from "./profile.ts";
 import { META_INSTRUCTION, STRATEGIES, type StrategyName } from "./strategies.ts";
 import { estimateContextTokens, estimateTextTokens } from "./tokens.ts";
 
@@ -71,6 +78,8 @@ export interface AgentOptions {
   historyRepository?: HistoryRepository;
   workingMemoryRepository?: MemoryRepository;
   longTermMemoryRepository?: MemoryRepository;
+  /** Синхронный источник профиля; вызывается один раз в начале каждого respond(). */
+  profileProvider?: () => UserProfile;
 }
 
 type PreparedParams = DeepSeekParams & {
@@ -91,6 +100,7 @@ interface TurnContext {
   facts: Facts | null;
   summary: string | null;
   memory: WritableMemory;
+  profile: UserProfile;
 }
 
 export interface ContextStatus {
@@ -116,6 +126,7 @@ export class Agent {
   private readonly config: Readonly<AgentConfig>;
   private readonly historyRepository: HistoryRepository | undefined;
   private readonly memoryRepositories: Record<WritableMemoryLayer, MemoryRepository | undefined>;
+  private readonly profileProvider: (() => UserProfile) | undefined;
   private history: HistoryState;
   private memory: WritableMemory;
   private sessionUsage: TokenUsage = emptyUsage();
@@ -126,6 +137,7 @@ export class Agent {
     this.client = options.client;
     this.config = Object.freeze({ ...options.config });
     this.historyRepository = options.historyRepository;
+    this.profileProvider = options.profileProvider;
     this.history = structuredClone(this.historyRepository?.load() ?? emptyHistory(this.config.contextStrategy));
     if (this.history.kind !== (this.config.contextStrategy ?? "compression")) {
       throw new AgentConfigError("Стратегия сохранённой истории не совпадает с contextStrategy.");
@@ -170,6 +182,7 @@ export class Agent {
             ...(this.config.temperature === null ? {} : { temperature: this.config.temperature }),
           },
           "суммаризация",
+          null,
         );
         if (!summary.text.trim() || summary.finishReason === "length") {
           throw new AgentResponseError(
@@ -194,6 +207,7 @@ export class Agent {
             ...(this.config.temperature === null ? {} : { temperature: this.config.temperature }),
           },
           "обновление facts",
+          null,
         );
         factsCall = extracted.usage;
         turnUsage = addUsage(turnUsage, extracted.usage);
@@ -376,22 +390,31 @@ export class Agent {
 
   private turnContext(): TurnContext {
     const memory = structuredClone(this.memory);
+    const profile = structuredClone(this.profileProvider?.() ?? {});
     if (this.history.kind === "branching") {
       return {
         messages: structuredClone(this.history.branches[this.history.activeBranch]!),
         facts: null,
         summary: null,
         memory,
+        profile,
       };
     }
     if (this.history.kind === "compression") {
-      return { messages: structuredClone(this.history.messages), summary: this.history.summary, facts: null, memory };
+      return {
+        messages: structuredClone(this.history.messages),
+        summary: this.history.summary,
+        facts: null,
+        memory,
+        profile,
+      };
     }
     return {
       summary: null,
       messages: structuredClone(this.history.messages.slice(-this.config.historyKeepLastMessages)),
       facts: this.history.kind === "facts" ? { ...this.history.facts } : null,
       memory,
+      profile,
     };
   }
 
@@ -402,20 +425,32 @@ export class Agent {
     applyOutputPolicy: boolean,
   ): Promise<CompletionResult> {
     const params = this.buildParams(context, question, extraInstruction, applyOutputPolicy);
-    return this.execute(params, applyOutputPolicy ? "финальный ответ" : "meta");
+    return this.execute(params, applyOutputPolicy ? "финальный ответ" : "meta", context);
   }
 
-  private async execute(params: PreparedParams, stage: string): Promise<CompletionResult> {
+  /** context равен null для служебных summary и facts: их подсказка не упоминает память и профиль. */
+  private async execute(params: PreparedParams, stage: string, context: TurnContext | null): Promise<CompletionResult> {
     const contextTokens = estimateContextTokens(params.messages);
 
     if (this.config.maxInputTokens !== null && contextTokens > this.config.maxInputTokens) {
+      const hints =
+        context === null
+          ? ["Увеличьте maxInputTokens или очистите историю командой /reset."]
+          : [
+              "Сократите вопрос или очистите историю командой /reset.",
+              ...(hasMemory(context.memory)
+                ? [
+                    "Рабочая и долговременная память тоже входят в запрос, а /reset их сохраняет: при необходимости сократите их командами /memory delete или /memory clear.",
+                  ]
+                : []),
+              ...(isProfileEmpty(context.profile)
+                ? []
+                : [
+                    "Профиль пользователя тоже входит в запрос, а /reset его сохраняет: при необходимости сократите его командами /profile delete или /profile clear.",
+                  ]),
+            ];
       throw new AgentContextLimitError(
-        `Этап «${stage}»: оценка входного контекста ≈ ${contextTokens} токенов превышает установленный лимит ${this.config.maxInputTokens}. ` +
-          (stage === "обновление facts" || stage === "суммаризация"
-            ? "Увеличьте maxInputTokens или очистите историю командой /reset."
-            : hasMemory(this.memory)
-              ? "Сократите вопрос или очистите историю командой /reset. Рабочая и долговременная память тоже входят в запрос, а /reset их сохраняет: при необходимости сократите их командами /memory delete или /memory clear."
-              : "Сократите вопрос или очистите историю командой /reset."),
+        `Этап «${stage}»: оценка входного контекста ≈ ${contextTokens} токенов превышает установленный лимит ${this.config.maxInputTokens}. ${hints.join(" ")}`,
       );
     }
 
@@ -445,8 +480,16 @@ export class Agent {
       messages: [
         {
           role: "system",
-          content: this.buildSystemPrompt(extraInstruction, applyOutputPolicy, hasMemory(context.memory)),
+          content: this.buildSystemPrompt(
+            extraInstruction,
+            applyOutputPolicy,
+            hasMemory(context.memory),
+            !isProfileEmpty(context.profile),
+          ),
         },
+        ...(isProfileEmpty(context.profile)
+          ? []
+          : [{ role: "user" as const, content: `${PROFILE_TITLE}\n${JSON.stringify(context.profile)}` }]),
         ...memoryMessages(LONG_TERM_MEMORY_TITLE, context.memory.long),
         ...memoryMessages(WORKING_MEMORY_TITLE, context.memory.working),
         ...(context.summary === null
@@ -482,8 +525,19 @@ export class Agent {
     return params;
   }
 
-  private buildSystemPrompt(extraInstruction: string, applyOutputPolicy: boolean, withMemory: boolean): string {
-    const blocks = [this.config.systemPrompt, withMemory ? MEMORY_INSTRUCTION : "", extraInstruction];
+  private buildSystemPrompt(
+    extraInstruction: string,
+    applyOutputPolicy: boolean,
+    withMemory: boolean,
+    withProfile: boolean,
+  ): string {
+    const blocks = [
+      this.config.systemPrompt,
+      withProfile ? PROFILE_INSTRUCTION : "",
+      withMemory ? MEMORY_INSTRUCTION : "",
+      extraInstruction,
+      withProfile && !applyOutputPolicy ? PROFILE_META_INSTRUCTION : "",
+    ];
 
     if (applyOutputPolicy) {
       blocks.push(FORMATS[this.config.format].instruction);
