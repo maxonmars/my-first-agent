@@ -11,6 +11,13 @@ const mockApi = fileURLToPath(new URL("./support/mock-api.ts", import.meta.url))
 let workingDirectory: string;
 let historyPath: string;
 const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.";
+const HEADER = "── my-first-agent ──\n\nПользователь: без профиля\nКонтекст: sliding\n";
+const COMMANDS_HINT = "Команды: /help · /task · /memory · /profile\n";
+const PAUSE_HINT = "Далее → /task resume, чтобы вернуться к задаче; сейчас реплики идут в обычный чат";
+
+function stateBlock(lines: string[]): string {
+  return `\n── Состояние задачи ──\n\n${lines.join("\n")}\n`;
+}
 
 beforeEach(() => {
   workingDirectory = mkdtempSync(join(tmpdir(), "my-first-agent-e2e-"));
@@ -30,7 +37,7 @@ function runProcess(args: string[], input?: string, env = process.env) {
 }
 
 function mockEnvironment(): NodeJS.ProcessEnv {
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     DEEPSEEK_API_KEY: "sk-test",
     DEEPSEEK_MODEL: "mock-model",
@@ -38,6 +45,9 @@ function mockEnvironment(): NodeJS.ProcessEnv {
     AGENT_KEEP_LAST_MESSAGES: "10",
     AGENT_MAX_INPUT_TOKENS: "",
   };
+  // Вывод процесса идёт в pipe; цвет включили бы только эти переменные окружения запуска тестов.
+  for (const name of ["FORCE_COLOR", "NO_COLOR", "NODE_DISABLE_COLORS"]) delete env[name];
+  return env;
 }
 
 function readHistory(): unknown {
@@ -61,8 +71,11 @@ describe("CLI process", () => {
     const result = runProcess(["проверка связи"], undefined, mockEnvironment());
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("Эхо: проверка связи");
-    expect(result.stdout).toContain("ход 8, сессия 8");
+    expect(result.stdout).toBe(
+      `${HEADER}\n── Ответ агента ──\n\nЭхо: проверка связи\n` +
+        "\n── Токены ──\n\nОценка ≈ вопрос 4 · контекст 16\nAPI, финал: вход 5 · генерация 3\n" +
+        "Из генерации: рассуждение 1\nХод 8 · сессия 8\n",
+    );
     expect(result.stderr).toBe("");
     expect(readHistory()).toEqual({
       kind: "sliding",
@@ -71,6 +84,43 @@ describe("CLI process", () => {
         { role: "assistant", content: "Эхо: проверка связи" },
       ],
     });
+  });
+
+  it("prints /help without a model call and without writing files", () => {
+    const result = runProcess([], "/help\n/exit\n", mockEnvironment());
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout.startsWith(`${HEADER}${COMMANDS_HINT}\nбез профиля > \n── Справка ──\n\nДиалог\n`)).toBe(true);
+    expect(result.stdout).not.toContain("── Токены ──");
+    expect(result.stdout).not.toContain("\u001b");
+    expect(readdirSync(workingDirectory)).toEqual([]);
+  });
+
+  it("colors output under FORCE_COLOR without writing styling to history, memory, profiles or task", () => {
+    const result = runProcess(
+      [],
+      "/profile-init\nМакс\nНа ты\n\n\n/memory set working goal поездка\n/task start Ответ клиенту о задержке\n" +
+        "Продолжай\n/task pause\nвопрос в чат\n/exit\n",
+      { ...mockEnvironment(), FORCE_COLOR: "1" },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain(
+      "\u001b[36m\u001b[1m── Ответ агента ──\u001b[22m\u001b[39m\n\nПлан из двух шагов.\n",
+    );
+    expect(result.stdout).toContain("\u001b[35mМакс [чат, задача на паузе] >\u001b[39m ");
+    const files = readdirSync(workingDirectory, { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => join(entry.parentPath, entry.name));
+    expect(files.map((file) => file.split("/").at(-1)).sort()).toEqual([
+      ".agent-history.sliding.json",
+      ".agent-memory.working.json",
+      ".agent-profiles.json",
+      ".agent-task.json",
+    ]);
+    for (const file of files) expect(readFileSync(file, "utf8")).not.toContain("\u001b");
   });
 
   it("restores an interactive turn in a new one-shot process and starts token usage from zero", () => {
@@ -83,8 +133,8 @@ describe("CLI process", () => {
     const second = runProcess(["Как меня зовут?"], undefined, mockEnvironment());
 
     expect(second.status).toBe(0);
-    expect(second.stdout).toContain("Вас зовут Максим.");
-    expect(second.stdout).toContain("ход 8, сессия 8");
+    expect(second.stdout).toContain("\n── Ответ агента ──\n\nВас зовут Максим.\n");
+    expect(second.stdout).toContain("Ход 8 · сессия 8");
     expect(second.stderr).toBe("");
     expect(readHistory()).toEqual({
       kind: "sliding",
@@ -140,11 +190,11 @@ it("blocks growing history locally and recovers through interactive reset", () =
   const result = runProcess([], "abcd\nabcd\nabcd\n/reset\nabcd\n/exit\n", env);
   expect(result.status).toBe(0);
   expect(result.stdout.match(/Эхо: abcd/g)).toHaveLength(3);
-  expect(result.stdout.match(/новый вопрос ≈ 1, весь стек ≈ 13/g)).toHaveLength(2);
-  expect(result.stdout).toContain("новый вопрос ≈ 1, весь стек ≈ 17");
-  expect(result.stderr).toContain("≈ 21 токенов превышает установленный лимит 17");
-  expect(result.stdout).toContain("ход 8, сессия 16");
-  expect(result.stdout.split(RESET_MESSAGE)[1]).toContain("ход 8, сессия 8");
+  expect(result.stdout.match(/Оценка ≈ вопрос 1 · контекст 13/g)).toHaveLength(2);
+  expect(result.stdout).toContain("Оценка ≈ вопрос 1 · контекст 17");
+  expect(result.stderr).toMatch(/^Ошибка · Запрос не удался: .*≈ 21 токенов превышает установленный лимит 17/);
+  expect(result.stdout).toContain("Ход 8 · сессия 16");
+  expect(result.stdout.split(RESET_MESSAGE)[1]).toContain("Ход 8 · сессия 8");
   expect(readHistory()).toEqual({
     kind: "sliding",
     messages: [
@@ -155,7 +205,7 @@ it("blocks growing history locally and recovers through interactive reset", () =
   const beforeRefusal = readFileSync(historyPath, "utf8");
   const blocked = runProcess(["x".repeat(100)], undefined, env);
   expect(blocked.status).toBe(1);
-  expect(blocked.stdout).toBe("Пользователь: не выбран\nКонтекст: sliding\n");
+  expect(blocked.stdout).toBe(HEADER);
   expect(blocked.stderr).toContain("превышает установленный лимит 17");
   expect(readFileSync(historyPath, "utf8")).toBe(beforeRefusal);
 });
@@ -198,7 +248,7 @@ it("restores facts after their source leaves the window and keeps other modes an
   expect(second.status).toBe(0);
   expect(second.stderr).toBe("");
   expect(second.stdout).toContain("Facts и окно восстановлены.");
-  expect(second.stdout).toContain("ход 16, сессия 16");
+  expect(second.stdout).toContain("API, facts: вход 5 · генерация 3 · итог 8\nХод 16 · сессия 16\n");
   const reset = runProcess([], "/reset\n/exit\n", env);
   expect(reset.status).toBe(0);
   expect(JSON.parse(readFileSync(factsPath, "utf8"))).toEqual({ kind: "facts", facts: {}, messages: [] });
@@ -215,14 +265,16 @@ it("restores active branch and checkpoint across processes, then clears all bran
   );
   expect(first.status).toBe(0);
   expect(first.stderr).toBe("");
-  expect(first.stdout).toContain("* a: 4 сообщений");
-  expect(first.stdout).toContain("ход 8, сессия 24");
+  expect(first.stdout).toContain(
+    "\n── Ветки ──\n\n- main: 2 сообщений\n* a: 4 сообщений — активная\n- b: 4 сообщений\n",
+  );
+  expect(first.stdout).toContain("Ход 8 · сессия 24");
   const second = runProcess(["Проверь ветку A"], undefined, env);
   expect(second.status).toBe(0);
   expect(second.stderr).toBe("");
   expect(second.stdout).toContain("Контекст: branching, ветка: a");
   expect(second.stdout).toContain("Ветка A восстановлена без B.");
-  expect(second.stdout).toContain("ход 8, сессия 8");
+  expect(second.stdout).toContain("Ход 8 · сессия 8");
   const third = runProcess([], "/branch c\nПроверь checkpoint\n/reset\n/exit\n", env);
   expect(third.status).toBe(0);
   expect(third.stderr).toBe("");
@@ -248,7 +300,7 @@ it("switches from full history to compression and back using one file", () => {
   const compressed = runProcess(["ход 11"], undefined, { ...env, AGENT_CONTEXT_STRATEGY: "compression" });
   expect(compressed.status).toBe(0);
   expect(compressed.stderr).toBe("");
-  expect(compressed.stdout).toContain("API, summary:");
+  expect(compressed.stdout).toContain("API, summary: вход 5 · генерация 3 · итог 8\nХод 16 · сессия 16\n");
   const saved = JSON.parse(readFileSync(legacyPath, "utf8"));
   expect(saved.summary).toBe("Факт из первых пяти ходов.");
   expect(saved.messages).toHaveLength(12);
@@ -261,7 +313,7 @@ it("switches from full history to compression and back using one file", () => {
   expect(second.stderr).toBe("");
   expect(second.stdout).toContain("Summary и хвост восстановлены.");
   expect(second.stdout).not.toContain("API, summary:");
-  expect(second.stdout).toContain("ход 8, сессия 8");
+  expect(second.stdout).toContain("Ход 8 · сессия 8");
   const reset = runProcess([], "/reset\n/exit\n", env);
   expect(reset.status).toBe(0);
   expect(JSON.parse(readFileSync(legacyPath, "utf8"))).toEqual({ summary: null, messages: [] });
@@ -298,12 +350,15 @@ it("persists explicit memory across processes, keeps it after reset and shares i
   expect(first.status).toBe(0);
   expect(first.stderr).toBe("");
   expect(first.stdout).toContain("Запись «transport» сохранена в long.");
-  expect(first.stdout).toContain("ход 8, сессия 8");
-  const shown = first.stdout.slice(first.stdout.indexOf("Краткосрочная память (short)"));
-  const [shortLayer, dictionaries] = shown.split("Рабочая память (working)");
+  expect(first.stdout).toContain("Ход 8 · сессия 8");
+  const shown = first.stdout.slice(first.stdout.indexOf("── Краткосрочная память (short) ──"));
+  const [shortLayer, dictionaries] = shown.split("── Рабочая память (working) ──");
   expect(shortLayer).toContain("КЕДР");
   expect(dictionaries).not.toContain("КЕДР");
-  expect(dictionaries).toContain('"budget": "30000 рублей"');
+  expect(dictionaries).toContain(
+    "Условия текущей задачи.\ngoal: поездка в Казань\nbudget: 30000 рублей\n\n── Долговременная память (long) ──\n\n" +
+      "Сведения, предпочтения и знания.\ntransport: предпочитаю поезд\n",
+  );
   expect(JSON.parse(readFileSync(workingPath, "utf8"))).toEqual({ goal: "поездка в Казань", budget: "30000 рублей" });
   expect(JSON.parse(readFileSync(longPath, "utf8"))).toEqual({ transport: "предпочитаю поезд" });
   const workingSource = readFileSync(workingPath, "utf8");
@@ -313,7 +368,7 @@ it("persists explicit memory across processes, keeps it after reset and shares i
   expect(restored.status).toBe(0);
   expect(restored.stderr).toBe("");
   expect(restored.stdout).toContain("Слои памяти получены.");
-  expect(restored.stdout).toContain("ход 8, сессия 8");
+  expect(restored.stdout).toContain("Ход 8 · сессия 8");
 
   const reset = runProcess([], "/reset\n/exit\n", env);
   expect(reset.status).toBe(0);
@@ -348,7 +403,9 @@ it("rejects one-shot memory commands and stops on corrupted memory without expos
 
   const command = runProcess(["/memory", "set", "working", "goal", "поездка"], undefined, env);
   expect(command.status).toBe(1);
-  expect(command.stderr).toBe("Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n");
+  expect(command.stderr).toBe(
+    "Ошибка · Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n",
+  );
   expect(existsSync(workingPath)).toBe(false);
   expect(existsSync(historyPath)).toBe(false);
 
@@ -375,7 +432,7 @@ it("creates two users, switches between them and restores the selected user's co
 
   const legacy = runProcess(["проверка связи"], undefined, env);
   expect(legacy.status).toBe(0);
-  expect(legacy.stdout.startsWith("Пользователь: не выбран\nКонтекст: sliding\n")).toBe(true);
+  expect(legacy.stdout.startsWith(HEADER)).toBe(true);
   expect(existsSync(join(workingDirectory, ".agent-profiles.json"))).toBe(false);
   const legacySource = readFileSync(historyPath, "utf8");
 
@@ -387,11 +444,14 @@ it("creates two users, switches between them and restores the selected user's co
   );
   expect(first.status).toBe(0);
   expect(first.stderr).toBe("");
-  expect(first.stdout).toContain("без профиля > Настройка профиля.");
-  expect(first.stdout).toContain("Профиль «Макс» сохранён.\nПользователь: Макс\nКонтекст: sliding\n");
-  expect(first.stdout).toContain("Макс > Эхо: Код Макса — КЕДР");
-  expect(first.stdout).toContain("Владимир > Эхо: Код Владимира — ДУБ");
-  expect(first.stdout.match(/ход 8, сессия 8/g)).toHaveLength(2);
+  expect(first.stdout).toContain("без профиля > \n── Настройка профиля ──\n");
+  expect(first.stdout).toContain(
+    "Профиль «Макс» сохранён.\nПользователь: Макс\nКонтекст: sliding\n\n── Профиль «Макс» ──\n\n" +
+      "style: На ты, списком\nconstraints: Без эмодзи\ncontext: Backend-разработчик\n\nМакс > ",
+  );
+  expect(first.stdout).toContain("Макс > \n── Ответ агента ──\n\nЭхо: Код Макса — КЕДР\n");
+  expect(first.stdout).toContain("Владимир > \n── Ответ агента ──\n\nЭхо: Код Владимира — ДУБ\n");
+  expect(first.stdout.match(/Ход 8 · сессия 8/g)).toHaveLength(2);
   expect(readJson(join(workingDirectory, ".agent-profiles.json"))).toEqual({
     activeUserId: "Владимир",
     profiles: {
@@ -409,7 +469,7 @@ it("creates two users, switches between them and restores the selected user's co
   const second = runProcess(["Проверь профиль Владимира"], undefined, env);
   expect(second.status).toBe(0);
   expect(second.stderr).toBe("");
-  expect(second.stdout.startsWith("Пользователь: Владимир\nКонтекст: sliding\n")).toBe(true);
+  expect(second.stdout.startsWith("── my-first-agent ──\n\nПользователь: Владимир\nКонтекст: sliding\n\n")).toBe(true);
   expect(second.stdout).toContain("Профиль Владимира получен.");
 
   const third = runProcess(
@@ -419,7 +479,7 @@ it("creates two users, switches between them and restores the selected user's co
   );
   expect(third.status).toBe(0);
   expect(third.stderr).toBe("");
-  expect(third.stdout).toContain("Владимир > Пользователь: Макс\nКонтекст: sliding\nМакс > ");
+  expect(third.stdout).toContain("Владимир > Пользователь: Макс\nКонтекст: sliding\n\nМакс > ");
   expect(third.stdout).toContain("Профиль Макса получен.");
   expect(readJson(userPath("Макс", ".agent-memory.long-term.json"))).toEqual({ language: "TypeScript" });
   expect(existsSync(userPath("Владимир", ".agent-memory.long-term.json"))).toBe(false);
@@ -428,9 +488,9 @@ it("creates two users, switches between them and restores the selected user's co
   const fourth = runProcess(["Проверь профиль Макса"], undefined, env);
   expect(fourth.status).toBe(0);
   expect(fourth.stderr).toBe("");
-  expect(fourth.stdout.startsWith("Пользователь: Макс\nКонтекст: sliding\n")).toBe(true);
+  expect(fourth.stdout.startsWith("── my-first-agent ──\n\nПользователь: Макс\nКонтекст: sliding\n\n")).toBe(true);
   expect(fourth.stdout).toContain("Профиль Макса получен.");
-  expect(fourth.stdout).toContain("ход 8, сессия 8");
+  expect(fourth.stdout).toContain("Ход 8 · сессия 8");
   expect(readJson(join(workingDirectory, ".agent-profiles.json")).activeUserId).toBe("Макс");
   expect(readJson(userPath("Макс", ".agent-history.sliding.json")).messages).toHaveLength(6);
   expect(readJson(userPath("Владимир", ".agent-history.sliding.json")).messages).toHaveLength(4);
@@ -451,10 +511,10 @@ it("runs a task through a pause, an ordinary chat and a restart, sharing it with
   );
   expect(first.status).toBe(0);
   expect(first.stderr).toBe("");
-  expect(first.stdout).toContain("без профиля [задача] > План из двух шагов.");
-  expect(first.stdout).toContain("без профиля [задача] > Результат шага 1");
-  expect(first.stdout).toContain("без профиля [чат, задача на паузе] > Чат без задачи.");
-  expect(first.stdout).toContain("ход 8, сессия 24");
+  expect(first.stdout).toContain("без профиля [задача] > \n── Ответ агента ──\n\nПлан из двух шагов.\n");
+  expect(first.stdout).toContain("без профиля [задача] > \n── Ответ агента ──\n\nРезультат шага 1\n");
+  expect(first.stdout).toContain("без профиля [чат, задача на паузе] > \n── Ответ агента ──\n\nЧат без задачи.\n");
+  expect(first.stdout).toContain("Ход 8 · сессия 24");
   expect(first.stdout).not.toContain("сессия 32");
   expect(readTask()).toEqual({
     context: {
@@ -484,26 +544,48 @@ it("runs a task through a pause, an ordinary chat and a restart, sharing it with
   const second = runProcess([], "/task resume\nПродолжай\nПроверь\n/task\n/exit\n", env);
   expect(second.status).toBe(0);
   expect(second.stderr).toBe("");
+  const secondStep = "Шаги: 1/2 выполнены. Сейчас шаг 2 из 2: Подготовить текст клиенту";
+  expect(second.stdout.startsWith(`${HEADER}${COMMANDS_HINT}`)).toBe(true);
   expect(second.stdout).toContain(
-    "Контекст: sliding\nЗадача: execution, на паузе — шаг 2 из 2: Подготовить текст клиенту\n" +
-      "Ожидается: возобновить задачу командой /task resume\nСледующая реплика: в обычный чат\n",
+    `${COMMANDS_HINT}${stateBlock(["Выполнение (execution)", "На паузе", secondStep, PAUSE_HINT])}`,
   );
-  expect(second.stdout).toContain("Результат шага 2\n");
-  expect(second.stdout).toContain("Задача: validation — проверка результатов\n");
-  expect(second.stdout).toContain("Проверка пройдена:\nСроков и компенсаций нет.\nЗадача: done — задача завершена\n");
-  expect(second.stdout).toContain("ход 8, сессия 16");
+  expect(second.stdout).toContain(
+    "Задача возобновлена. Реплики снова идут в задачу.\n" +
+      stateBlock(["Выполнение (execution)", secondStep, "Далее → продолжите шаг 2, например репликой «Продолжай»"]),
+  );
+  expect(second.stdout).toContain("\n── Ответ агента ──\n\nРезультат шага 2\n\n── Токены ──\n");
+  expect(second.stdout).toContain(
+    stateBlock([
+      "Проверка результатов (validation)",
+      "Шаги: 2/2 выполнены. Ожидается проверка.",
+      "Далее → отправьте «Проверь результат»",
+    ]),
+  );
+  const done = stateBlock([
+    "Завершена (done)",
+    "Шаги: 2/2 выполнены. Проверка пройдена.",
+    "Далее → обязательных действий нет; можно обсудить результат",
+  ]);
+  // Состояние done — после хода проверки и в конце полного /task.
+  expect(second.stdout.split(done)).toHaveLength(3);
+  expect(second.stdout).toContain("\n── Ответ агента ──\n\nСроков и компенсаций нет.\n\n── Токены ──\n");
+  expect(second.stdout).toContain(
+    "\n── План ──\n\n[x] 1. Определить допустимое содержание ответа\n[x] 2. Подготовить текст клиенту\n",
+  );
+  expect(second.stdout).toContain("\n── Проверка ──\n\nПроверка пройдена:\nСроков и компенсаций нет.\n");
+  expect(second.stdout).toContain("Ход 8 · сессия 16");
   expect(readTask().context).toMatchObject({
     state: "done",
     paused: false,
     results: ["Результат шага 1", "Результат шага 2"],
     review: { passed: true, text: "Сроков и компенсаций нет." },
   });
-  const done = readFileSync(taskPath, "utf8");
+  const doneSource = readFileSync(taskPath, "utf8");
 
   const branching = runProcess([], "/reset\n/exit\n", { ...env, AGENT_CONTEXT_STRATEGY: "branching" });
   expect(branching.status).toBe(0);
   expect(branching.stdout).toContain("Задача не изменена: удалить её можно командой /task clear.");
-  expect(readFileSync(taskPath, "utf8")).toBe(done);
+  expect(readFileSync(taskPath, "utf8")).toBe(doneSource);
   const discussion = runProcess(["Что в итоге?"], undefined, { ...env, AGENT_CONTEXT_STRATEGY: "branching" });
   expect(discussion.status).toBe(0);
   expect(discussion.stderr).toBe("");
@@ -518,18 +600,27 @@ it("runs a task through a pause, an ordinary chat and a restart, sharing it with
 it("shows the saved plan after the turn and restart, and the saved question after resume, without the model", () => {
   const env = mockEnvironment();
   const taskPath = join(workingDirectory, ".agent-task.json");
-  const plan = "План на утверждение:\n  1. Определить допустимое содержание ответа\n  2. Подготовить текст клиенту\n";
+  const plan = [
+    "План на утверждение:",
+    "  [ ] 1. Определить допустимое содержание ответа",
+    "  [ ] 2. Подготовить текст клиенту",
+  ];
+  const approve = "Далее → /task approve или попросите изменить план";
 
   const first = runProcess([], "/task start Ответ клиенту о задержке заказа\nПродолжай\n/task pause\n/exit\n", env);
   expect(first.status).toBe(0);
   expect(first.stderr).toBe("");
-  expect(first.stdout).toContain(`ход 8, сессия 8\n${plan}Задача: planning — согласование плана\n`);
+  expect(first.stdout).toContain(`Ход 8 · сессия 8\n${stateBlock(["Планирование (planning)", ...plan, approve])}`);
 
   const second = runProcess([], "/task resume\n/exit\n", env);
   expect(second.status).toBe(0);
-  expect(second.stdout).toContain(`Контекст: sliding\n${plan}Задача: planning, на паузе`);
-  expect(second.stdout).toContain(`Задача возобновлена.\n${plan}Задача: planning — согласование плана\n`);
-  expect(second.stdout).not.toContain("расход токенов");
+  expect(second.stdout).toContain(
+    `${COMMANDS_HINT}${stateBlock(["Планирование (planning)", "На паузе", ...plan, PAUSE_HINT])}`,
+  );
+  expect(second.stdout).toContain(
+    `Задача возобновлена. Реплики снова идут в задачу.\n${stateBlock(["Планирование (planning)", ...plan, approve])}`,
+  );
+  expect(second.stdout).not.toContain("── Токены ──");
 
   const saved = JSON.parse(readFileSync(taskPath, "utf8"));
   writeFileSync(
@@ -542,15 +633,15 @@ it("shows the saved plan after the turn and restart, and the saved question afte
   const third = runProcess([], "/task resume\n/exit\n", env);
   expect(third.status).toBe(0);
   expect(third.stderr).toBe("");
+  const question = "Вопрос агента: Какой номер заказа?";
   expect(third.stdout).toContain(
-    "Вопрос агента: Какой номер заказа?\nЗадача: planning, на паузе — сбор требований\n" +
-      "Ожидается: возобновить задачу командой /task resume\nСледующая реплика: в обычный чат\n",
+    stateBlock(["Планирование (planning)", "На паузе", "Сбор требований.", question, PAUSE_HINT]),
   );
   expect(third.stdout).toContain(
-    "Задача возобновлена.\nВопрос агента: Какой номер заказа?\nЗадача: planning — сбор требований\n" +
-      "Ожидается: ответить на вопрос агента\nСледующая реплика: в задачу\n",
+    "Задача возобновлена. Реплики снова идут в задачу.\n" +
+      stateBlock(["Планирование (planning)", "Сбор требований.", question, "Далее → ответьте на вопрос агента"]),
   );
-  expect(third.stdout).not.toContain("расход токенов");
+  expect(third.stdout).not.toContain("── Токены ──");
   expect(JSON.parse(readFileSync(taskPath, "utf8")).context).toMatchObject({
     waitingFor: "Какой номер заказа?",
     paused: false,

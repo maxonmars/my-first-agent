@@ -1,6 +1,24 @@
 import * as readline from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import type { AgentResult, ContextStatus } from "./agent.ts";
+import {
+  type HelpGroup,
+  printAnswer,
+  printBranches,
+  printError,
+  printHelp,
+  printMemoryLayer,
+  printNotice,
+  printProfile,
+  printProfileIntro,
+  printProfileStep,
+  printPrompt,
+  printSession,
+  printSuccess,
+  printTask,
+  printTaskState,
+  printWarning,
+} from "./cli-view.ts";
 import { MEMORY_LAYERS, type MemoryLayer, type MemorySnapshot, type WritableMemoryLayer } from "./memory.ts";
 import { normalizeUserId, PROFILE_FIELDS, type ProfileField, USER_ID_RULE, type UserProfile } from "./profile.ts";
 import type { TaskView } from "./task.ts";
@@ -49,11 +67,6 @@ const MEMORY_USAGE = {
   delete: "/memory delete working|long ключ",
   clear: "/memory clear short|working|long",
 };
-const MEMORY_TITLES: Record<MemoryLayer, string> = {
-  short: "Краткосрочная память (short) — состояние диалога выбранной стратегии",
-  working: "Рабочая память (working) — условия текущей задачи",
-  long: "Долговременная память (long) — сведения, предпочтения и знания",
-};
 const TASK_USAGE = {
   start: "/task start описание",
   approve: "/task approve",
@@ -86,32 +99,71 @@ const PROFILE_QUESTIONS: Record<ProfileField, { question: string; hint: string }
 /** Черновик опроса /profile-init; userId === null — ещё не введён идентификатор. */
 type ProfileWizard = { userId: null } | { userId: string; field: ProfileField; draft: UserProfile };
 
-const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.\n";
-const HELP = [
-  "Диалог с агентом. Команды:",
-  "  /reset — очистить диалог выбранной стратегии и статистику; рабочая и долговременная память, профиль и задача сохраняются",
-  "  /memory — показать все слои памяти",
-  ...Object.values(MEMORY_USAGE).map((usage) => `  ${usage}`),
-  "  /profile-init — создать или изменить профиль пошаговым опросом и выбрать пользователя",
-  "  /profile — показать активного пользователя и профиль",
-  ...Object.values(PROFILE_USAGE).map((usage) => `  ${usage}`),
-  "  /task — показать задачу: этап, план, результаты, проверку и ожидаемое действие",
-  "  /task start описание — создать задачу; модель начнёт работу со следующей реплики",
-  "  /task approve — утвердить предложенный план и перейти к выполнению",
-  "  /task pause — приостановить задачу: реплики пойдут в обычный чат",
-  "  /task resume — вернуть реплики в задачу",
-  "  /task clear — удалить задачу; /reset её не удаляет",
-  "  /exit — завершить диалог",
-  "Новый разговор: /reset, затем /memory clear working. Задачу удаляет только /task clear.",
-  "В branching: /checkpoint, /branch имя, /switch имя, /branches.",
-].join("\n");
+const HELP: readonly HelpGroup[] = [
+  {
+    title: "Диалог",
+    lines: [
+      "Реплика без / уходит агенту: в задачу или в обычный чат — это видно по приглашению.",
+      ["/help", "показать эту справку"],
+      [
+        "/reset",
+        "очистить историю выбранной стратегии и статистику; рабочая и долговременная память, профиль и задача сохраняются",
+      ],
+      ["/exit", "завершить диалог"],
+      "Новый разговор: /reset, затем /memory clear working — рабочая память очищается отдельно.",
+      "Задачу удаляет только /task clear.",
+    ],
+  },
+  {
+    title: "Задача",
+    lines: [
+      ["/task", "показать описание, план, результаты, проверку, вопрос агента и следующее действие"],
+      [TASK_USAGE.start, "создать задачу; модель начнёт работу со следующей реплики"],
+      [TASK_USAGE.approve, "утвердить предложенный план и перейти к выполнению"],
+      [TASK_USAGE.pause, "приостановить задачу: реплики пойдут в обычный чат"],
+      [TASK_USAGE.resume, "вернуть реплики в задачу"],
+      [TASK_USAGE.clear, "удалить задачу; /reset её не удаляет"],
+    ],
+  },
+  {
+    title: "Память",
+    lines: [
+      ["/memory", "показать все слои памяти"],
+      [MEMORY_USAGE.show, "показать один слой"],
+      [MEMORY_USAGE.set, "создать или заменить запись; значение — остаток строки"],
+      [MEMORY_USAGE.delete, "удалить запись"],
+      [MEMORY_USAGE.clear, "очистить слой; clear short — то же, что /reset"],
+    ],
+  },
+  {
+    title: "Профиль",
+    lines: [
+      ["/profile-init", "создать или изменить профиль пошаговым опросом и выбрать пользователя"],
+      ["/profile", "показать активного пользователя и профиль"],
+      [PROFILE_USAGE.load, "выбрать существующего пользователя"],
+      [PROFILE_USAGE.set, "заменить группу профиля; значение — остаток строки"],
+      [PROFILE_USAGE.delete, "удалить группу профиля"],
+      [PROFILE_USAGE.clear, "очистить профиль; история и память пользователя сохраняются"],
+    ],
+  },
+  {
+    title: "Ветки",
+    lines: [
+      "Только в режиме branching: AGENT_CONTEXT_STRATEGY=branching.",
+      ["/checkpoint", "сохранить снимок активной ветки"],
+      ["/branch имя", "создать ветку из checkpoint и сделать её активной"],
+      ["/switch имя", "перейти в существующую ветку"],
+      ["/branches", "показать ветки, число сообщений и активную ветку"],
+    ],
+  },
+];
 
 export async function runCli(agent: SessionPort, args: string[], io: CliIo): Promise<number> {
-  writeStatus(io.output, agent);
   const question = args.join(" ").trim();
+  writeStatus(io.output, agent, { title: true, commandsHint: question.length === 0 });
 
   if (question.startsWith("/")) {
-    io.error.write("Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n");
+    printError(io.error, "Команды доступны только в интерактивном режиме: запустите CLI без аргументов.");
     return 1;
   }
   if (question.length > 0) return runOnce(agent, question, io);
@@ -121,11 +173,11 @@ export async function runCli(agent: SessionPort, args: string[], io: CliIo): Pro
 
 async function runOnce(agent: AgentPort, question: string, io: CliIo): Promise<number> {
   try {
-    writeResult(io.output, await agent.respond(question));
+    printAnswer(io.output, await agent.respond(question));
     writeTaskTurnStatus(io.output, agent);
     return 0;
   } catch (error) {
-    io.error.write(`Запрос не удался: ${messageOf(error)}\n`);
+    printError(io.error, `Запрос не удался: ${messageOf(error)}`);
     return 1;
   }
 }
@@ -134,7 +186,6 @@ async function runInteractive(agent: SessionPort, io: CliIo): Promise<number> {
   const rl = readline.createInterface({ input: io.input, output: io.output, terminal: false });
   let wizard: ProfileWizard | null = null;
 
-  io.output.write(`${HELP}\n`);
   writePrompt(io.output, agent, wizard);
 
   for await (const line of rl) {
@@ -159,40 +210,45 @@ async function handleLine(agent: SessionPort, question: string, io: CliIo): Prom
       agent.reset();
       writeReset(io.output, agent);
     } catch (error) {
-      io.error.write(`Не удалось сбросить контекст: ${messageOf(error)}\n`);
+      printError(io.error, `Не удалось сбросить контекст: ${messageOf(error)}`);
     }
     return null;
   }
 
   if (command === "/profile-init") {
     if (question.split(/\s+/).length > 1) {
-      io.error.write("Команда не выполнена: Лишние аргументы. Использование: /profile-init\n");
+      printError(io.error, "Команда не выполнена: Лишние аргументы. Использование: /profile-init");
       return null;
     }
-    io.output.write("Настройка профиля. /cancel — отменить, /exit — выйти без сохранения.\n");
-    io.output.write(`${USER_ID_QUESTION}\n`);
+    printProfileIntro(io.output, USER_ID_QUESTION);
     return { userId: null };
   }
 
   if (question.startsWith("/")) {
     try {
-      if (command === "/memory") runMemoryCommand(agent, question, io.output);
+      if (command === "/help") runHelpCommand(question, io.output);
+      else if (command === "/memory") runMemoryCommand(agent, question, io.output);
       else if (command === "/profile") runProfileCommand(agent, question, io.output);
       else if (command === "/task") runTaskCommand(agent, question, io.output);
       else runBranchCommand(agent, question, io.output);
     } catch (error) {
-      io.error.write(`Команда не выполнена: ${messageOf(error)}\n`);
+      printError(io.error, `Команда не выполнена: ${messageOf(error)}`);
     }
     return null;
   }
 
   try {
-    writeResult(io.output, await agent.respond(question));
+    printAnswer(io.output, await agent.respond(question));
     writeTaskTurnStatus(io.output, agent);
   } catch (error) {
-    io.error.write(`Запрос не удался: ${messageOf(error)}\n`);
+    printError(io.error, `Запрос не удался: ${messageOf(error)}`);
   }
   return null;
+}
+
+function runHelpCommand(input: string, output: Writable): void {
+  expectWordCount(input.split(/\s+/), 1, "/help");
+  printHelp(output, HELP);
 }
 
 function stepWizard(
@@ -204,12 +260,13 @@ function stepWizard(
   const command = answer.toLowerCase();
   if (command === "/exit") return "exit";
   if (command === "/cancel") {
-    io.output.write("Настройка профиля отменена, изменения не сохранены.\n");
+    printNotice(io.output, "Настройка профиля отменена, изменения не сохранены.");
     return null;
   }
   if (answer.startsWith("/")) {
-    io.output.write(
-      "Во время настройки профиля команды не выполняются: ответьте на вопрос, /cancel — отменить, /exit — выйти.\n",
+    printWarning(
+      io.output,
+      "Во время настройки профиля команды не выполняются: ответьте на вопрос, /cancel — отменить, /exit — выйти.",
     );
     return wizard;
   }
@@ -217,11 +274,12 @@ function stepWizard(
   if (wizard.userId === null) {
     const userId = normalizeUserId(answer);
     if (userId === null) {
-      io.error.write(`Неверный ${USER_ID_RULE}.\n${USER_ID_QUESTION}\n`);
+      printError(io.error, `Неверный ${USER_ID_RULE}.`);
+      printNotice(io.error, USER_ID_QUESTION);
       return wizard;
     }
     const existing = agent.loadProfile(userId);
-    io.output.write(existing === null ? `Новый профиль «${userId}».\n` : `Изменение профиля «${userId}».\n`);
+    printNotice(io.output, existing === null ? `Новый профиль «${userId}».` : `Изменение профиля «${userId}».`);
     return askField(io.output, { userId, field: PROFILE_FIELDS[0], draft: existing ?? {} });
   }
 
@@ -232,25 +290,24 @@ function stepWizard(
   try {
     agent.initProfile(wizard.userId, draft);
   } catch (error) {
-    io.error.write(`Профиль не сохранён: ${messageOf(error)}\n`);
+    printError(io.error, `Профиль не сохранён: ${messageOf(error)}`);
     return null;
   }
-  io.output.write(`Профиль «${wizard.userId}» сохранён.\n`);
+  printSuccess(io.output, `Профиль «${wizard.userId}» сохранён.`);
   writeStatus(io.output, agent);
   writeProfile(io.output, agent);
   return null;
 }
 
 function askField(output: Writable, wizard: Extract<ProfileWizard, { userId: string }>): ProfileWizard {
-  const { question, hint } = PROFILE_QUESTIONS[wizard.field];
-  const current = wizard.draft[wizard.field];
-  output.write(
-    `Профиль «${wizard.userId}», ${PROFILE_FIELDS.indexOf(wizard.field) + 1}/${PROFILE_FIELDS.length} — ${wizard.field}: ${question}\n` +
-      `Подсказка: ${hint}.\n` +
-      (current === undefined
-        ? "Пустой ответ — пропустить группу.\n"
-        : `Сейчас: ${current}\nПустой ответ — оставить прежнее значение.\n`),
-  );
+  printProfileStep(output, {
+    userId: wizard.userId,
+    position: PROFILE_FIELDS.indexOf(wizard.field) + 1,
+    total: PROFILE_FIELDS.length,
+    field: wizard.field,
+    ...PROFILE_QUESTIONS[wizard.field],
+    current: wizard.draft[wizard.field],
+  });
   return wizard;
 }
 
@@ -266,7 +323,7 @@ function runProfileCommand(agent: SessionPort, input: string, output: Writable):
       expectWordCount(words, 3, PROFILE_USAGE.load);
       const alreadyActive = agent.getActiveUserId() === words[2];
       agent.switchUser(words[2]!);
-      if (alreadyActive) output.write(`Пользователь «${words[2]}» уже выбран.\n`);
+      if (alreadyActive) printNotice(output, `Пользователь «${words[2]}» уже выбран.`);
       writeStatus(output, agent);
       break;
     }
@@ -275,23 +332,21 @@ function runProfileCommand(agent: SessionPort, input: string, output: Writable):
       if (words.length < 4) throw new Error(`Не хватает аргументов. Использование: ${PROFILE_USAGE.set}`);
       // Значение — весь остаток строки после группы, с внутренними пробелами.
       agent.setProfileField(field, input.replace(/^(?:\S+\s+){3}/, ""));
-      output.write(`Группа ${field} сохранена в профиле «${agent.getActiveUserId()}».\n`);
+      printSuccess(output, `Группа ${field} сохранена в профиле «${agent.getActiveUserId()}».`);
       break;
     }
     case "delete": {
       const field = profileField(words[2], PROFILE_USAGE.delete);
       expectWordCount(words, 3, PROFILE_USAGE.delete);
-      output.write(
-        agent.deleteProfileField(field)
-          ? `Группа ${field} удалена из профиля «${agent.getActiveUserId()}».\n`
-          : `Группы ${field} нет в профиле «${agent.getActiveUserId()}».\n`,
-      );
+      if (agent.deleteProfileField(field)) {
+        printSuccess(output, `Группа ${field} удалена из профиля «${agent.getActiveUserId()}».`);
+      } else printNotice(output, `Группы ${field} нет в профиле «${agent.getActiveUserId()}».`);
       break;
     }
     case "clear":
       expectWordCount(words, 2, PROFILE_USAGE.clear);
       agent.clearProfile();
-      output.write(`Профиль «${agent.getActiveUserId()}» очищен. История и память пользователя сохранены.\n`);
+      printSuccess(output, `Профиль «${agent.getActiveUserId()}» очищен.`, "История и память пользователя сохранены.");
       break;
     default:
       throw new Error(
@@ -307,31 +362,32 @@ function profileField(word: string | undefined, usage: string): ProfileField {
   return field;
 }
 
-function writeStatus(output: Writable, agent: SessionPort): void {
-  const status = agent.getContextStatus();
-  output.write(
-    `Пользователь: ${agent.getActiveUserId() ?? "не выбран"}\n` +
-      `Контекст: ${status.strategy ?? "без стратегии"}${status.activeBranch === null ? "" : `, ветка: ${status.activeBranch}`}\n`,
-  );
+/** Пользователь, контекст и задача с черновиком плана и открытым вопросом. */
+function writeStatus(
+  output: Writable,
+  agent: SessionPort,
+  header: { title?: boolean; commandsHint?: boolean } = {},
+): void {
+  printSession(output, agent.getActiveUserId(), agent.getContextStatus(), header);
   const task = agent.getTask();
-  if (task !== null) writeTaskStatus(output, task, { plan: true, question: true });
+  if (task !== null) printTaskState(output, task, { plan: true, question: true });
 }
 
 function writeProfile(output: Writable, agent: SessionPort): void {
   const userId = agent.getActiveUserId();
   if (userId === null) {
-    output.write("Пользователь: не выбран. Создайте профиль командой /profile-init.\n");
+    printNotice(output, "Пользователь не выбран: работа без профиля. Создайте профиль командой /profile-init.");
     return;
   }
-  output.write(`Профиль пользователя «${userId}»:\n${JSON.stringify(agent.loadProfile(userId), null, 2)}\n`);
+  printProfile(output, userId, agent.loadProfile(userId));
 }
 
 function writePrompt(output: Writable, agent: SessionPort, wizard: ProfileWizard | null): void {
   if (wizard === null) {
     const task = agent.getTask();
     const target = task === null ? "" : task.status.paused ? " [чат, задача на паузе]" : " [задача]";
-    output.write(`${agent.getActiveUserId() ?? "без профиля"}${target} > `);
-  } else output.write(wizard.userId === null ? "профиль > " : `профиль ${wizard.userId} > `);
+    printPrompt(output, `${agent.getActiveUserId() ?? "без профиля"}${target}`);
+  } else printPrompt(output, wizard.userId === null ? "профиль" : `профиль ${wizard.userId}`);
 }
 
 function runMemoryCommand(agent: AgentPort, input: string, output: Writable): void {
@@ -341,13 +397,13 @@ function runMemoryCommand(agent: AgentPort, input: string, output: Writable): vo
   switch (action) {
     case undefined: {
       const memory = agent.getMemory();
-      for (const layer of MEMORY_LAYERS) writeMemoryLayer(output, layer, memory[layer]);
+      for (const layer of MEMORY_LAYERS) printMemoryLayer(output, layer, memory[layer]);
       break;
     }
     case "show": {
       const layer = memoryLayer(words[2], MEMORY_LAYERS, MEMORY_USAGE.show);
       expectWordCount(words, 3, MEMORY_USAGE.show);
-      writeMemoryLayer(output, layer, agent.getMemory()[layer]);
+      printMemoryLayer(output, layer, agent.getMemory()[layer]);
       break;
     }
     case "set": {
@@ -355,17 +411,14 @@ function runMemoryCommand(agent: AgentPort, input: string, output: Writable): vo
       if (words.length < 5) throw new Error(`Не хватает аргументов. Использование: ${MEMORY_USAGE.set}`);
       // Значение — весь остаток строки после ключа, с внутренними пробелами.
       agent.setMemory(layer, words[3]!, input.replace(/^(?:\S+\s+){4}/, ""));
-      output.write(`Запись «${words[3]}» сохранена в ${layer}.\n`);
+      printSuccess(output, `Запись «${words[3]}» сохранена в ${layer}.`);
       break;
     }
     case "delete": {
       const layer = memoryLayer(words[2], WRITABLE_MEMORY_LAYERS, MEMORY_USAGE.delete);
       expectWordCount(words, 4, MEMORY_USAGE.delete);
-      output.write(
-        agent.deleteMemory(layer, words[3]!)
-          ? `Запись «${words[3]}» удалена из ${layer}.\n`
-          : `Запись «${words[3]}» не найдена в ${layer}.\n`,
-      );
+      if (agent.deleteMemory(layer, words[3]!)) printSuccess(output, `Запись «${words[3]}» удалена из ${layer}.`);
+      else printNotice(output, `Запись «${words[3]}» не найдена в ${layer}.`);
       break;
     }
     case "clear": {
@@ -373,7 +426,7 @@ function runMemoryCommand(agent: AgentPort, input: string, output: Writable): vo
       expectWordCount(words, 3, MEMORY_USAGE.clear);
       agent.clearMemory(layer);
       if (layer === "short") writeReset(output, agent);
-      else output.write(`Слой ${layer} очищен.\n`);
+      else printSuccess(output, `Слой ${layer} очищен.`);
       break;
     }
     default:
@@ -400,13 +453,13 @@ function expectWordCount(words: string[], count: number, usage: string): void {
   }
 }
 
-function writeMemoryLayer(output: Writable, layer: MemoryLayer, value: MemorySnapshot[MemoryLayer]): void {
-  output.write(`${MEMORY_TITLES[layer]}:\n${JSON.stringify(value, null, 2)}\n`);
-}
-
 function writeReset(output: Writable, agent: AgentPort): void {
-  output.write(RESET_MESSAGE);
-  if (agent.getTask() !== null) output.write("Задача не изменена: удалить её можно командой /task clear.\n");
+  printSuccess(
+    output,
+    "Диалог выбранной стратегии и статистика очищены.",
+    "Рабочая и долговременная память сохранены.",
+  );
+  if (agent.getTask() !== null) printNotice(output, "Задача не изменена: удалить её можно командой /task clear.");
 }
 
 function runTaskCommand(agent: AgentPort, input: string, output: Writable): void {
@@ -414,42 +467,45 @@ function runTaskCommand(agent: AgentPort, input: string, output: Writable): void
   const action = words[1]?.toLowerCase();
 
   switch (action) {
-    case undefined:
-      writeTask(output, agent.getTask());
+    case undefined: {
+      const task = agent.getTask();
+      if (task === null) printNotice(output, `Задачи нет. Создайте её командой ${TASK_USAGE.start}.`);
+      else printTask(output, task);
       return;
+    }
     case "start":
       if (words.length < 3) throw new Error(`Не хватает аргументов. Использование: ${TASK_USAGE.start}`);
       // Описание — остаток строки после подкоманды, с исходным регистром и внутренними пробелами.
       agent.startTask(input.replace(/^(?:\S+\s+){2}/, ""));
-      output.write("Задача создана. Модель начнёт работу по следующей реплике, например «Продолжай».\n");
+      printSuccess(output, "Задача создана.", "Модель начнёт работу по следующей реплике, например «Продолжай».");
       break;
     case "approve":
       expectWordCount(words, 2, TASK_USAGE.approve);
       agent.approveTask();
-      output.write("План утверждён. Первый шаг выполнится по следующей реплике, например «Продолжай».\n");
+      printSuccess(output, "План утверждён.", "Первый шаг выполнится по следующей реплике, например «Продолжай».");
       break;
     case "pause":
       expectWordCount(words, 2, TASK_USAGE.pause);
-      output.write(
-        agent.pauseTask()
-          ? "Задача приостановлена. Реплики идут в обычный чат; /task resume — вернуться к задаче.\n"
-          : "Задача уже на паузе.\n",
-      );
+      if (agent.pauseTask()) {
+        printSuccess(
+          output,
+          "Задача приостановлена.",
+          "Реплики идут в обычный чат; /task resume — вернуться к задаче.",
+        );
+      } else printNotice(output, "Задача уже на паузе.");
       break;
     case "resume": {
       expectWordCount(words, 2, TASK_USAGE.resume);
-      output.write(agent.resumeTask() ? "Задача возобновлена.\n" : "Задача уже активна.\n");
+      if (agent.resumeTask()) printSuccess(output, "Задача возобновлена.", "Реплики снова идут в задачу.");
+      else printNotice(output, "Задача уже активна.");
       const resumed = agent.getTask();
-      if (resumed !== null) writeTaskStatus(output, resumed, { plan: true, question: true });
+      if (resumed !== null) printTaskState(output, resumed, { plan: true, question: true });
       return;
     }
     case "clear":
       expectWordCount(words, 2, TASK_USAGE.clear);
-      output.write(
-        agent.clearTask()
-          ? "Задача удалена. Обычный диалог, профиль и память сохранены.\n"
-          : "Задачи нет, удалять нечего.\n",
-      );
+      if (agent.clearTask()) printSuccess(output, "Задача удалена.", "Обычный диалог, профиль и память сохранены.");
+      else printNotice(output, "Задачи нет, удалять нечего.");
       return;
     default:
       throw new Error(
@@ -457,56 +513,13 @@ function runTaskCommand(agent: AgentPort, input: string, output: Writable): void
       );
   }
   const task = agent.getTask();
-  if (task !== null) writeTaskStatus(output, task);
-}
-
-function writeTask(output: Writable, task: TaskView | null): void {
-  if (task === null) {
-    output.write(`Задачи нет. Создайте её командой ${TASK_USAGE.start}.\n`);
-    return;
-  }
-  const { context } = task;
-  const lines = [
-    `Описание задачи: ${context.task}`,
-    `Этап: ${context.state}`,
-    `Пауза: ${context.paused ? "да" : "нет"}`,
-  ];
-  lines.push(context.plan.length === 0 ? "План: ещё не предложен" : "План:");
-  context.plan.forEach((step, index) => {
-    lines.push(`  ${index + 1}. ${step}${index < context.results.length ? " — выполнен" : ""}`);
-  });
-  context.results.forEach((result, index) => {
-    lines.push(`Результат шага ${index + 1}:`, result);
-  });
-  if (context.review !== null) {
-    lines.push(context.review.passed ? "Проверка пройдена:" : "Замечания проверки:", context.review.text);
-  }
-  if (context.waitingFor !== null) lines.push("Вопрос агента:", context.waitingFor);
-  output.write(`${lines.join("\n")}\n`);
-  writeTaskStatus(output, task);
-}
-
-/** plan — черновик, ожидающий утверждения; question — открытый вопрос агента. Оба берутся из сохранённого состояния. */
-function writeTaskStatus(
-  output: Writable,
-  { context, status }: TaskView,
-  details: { plan?: boolean; question?: boolean } = {},
-): void {
-  if (details.plan && context.state === "planning" && context.plan.length > 0 && context.waitingFor === null) {
-    output.write(`План на утверждение:\n${context.plan.map((step, index) => `  ${index + 1}. ${step}`).join("\n")}\n`);
-  }
-  if (details.question && context.waitingFor !== null) output.write(`Вопрос агента: ${context.waitingFor}\n`);
-  output.write(
-    `Задача: ${status.state}${status.paused ? ", на паузе" : ""} — ${status.work}\n` +
-      `Ожидается: ${status.expectedAction}\n` +
-      `Следующая реплика: ${status.paused ? "в обычный чат" : "в задачу"}\n`,
-  );
+  if (task !== null) printTaskState(output, task);
 }
 
 /** Задача без паузы после ответа означает, что ход относился к ней. */
 function writeTaskTurnStatus(output: Writable, agent: AgentPort): void {
   const task = agent.getTask();
-  if (task !== null && !task.status.paused) writeTaskStatus(output, task, { plan: true });
+  if (task !== null && !task.status.paused) printTaskState(output, task, { plan: true });
 }
 
 function runBranchCommand(agent: AgentPort, input: string, output: Writable): void {
@@ -515,55 +528,22 @@ function runBranchCommand(agent: AgentPort, input: string, output: Writable): vo
     case "/checkpoint":
       if (name !== undefined) throw new Error("Использование: /checkpoint");
       agent.createCheckpoint();
-      output.write("Checkpoint сохранён из активной ветки.\n");
+      printSuccess(output, "Checkpoint сохранён из активной ветки.");
       break;
     case "/branch":
     case "/switch":
       if (name === undefined || extra.length > 0) throw new Error(`Использование: ${command} имя`);
       if (command.toLowerCase() === "/branch") agent.createBranch(name);
       else agent.switchBranch(name);
-      output.write(`Активная ветка: ${name}\n`);
+      printSuccess(output, `Активная ветка: ${name}`);
       break;
     case "/branches":
       if (name !== undefined) throw new Error("Использование: /branches");
-      for (const branch of agent.listBranches()) {
-        output.write(`${branch.active ? "*" : "-"} ${branch.name}: ${branch.messageCount} сообщений\n`);
-      }
+      printBranches(output, agent.listBranches());
       break;
     default:
       throw new Error(`Неизвестная команда: ${command}`);
   }
-}
-
-function writeResult(output: Writable, result: AgentResult): void {
-  const { factsCall, summaryCall, finalCall, turn, session } = result.usage;
-
-  output.write(`${result.text}\n`);
-  output.write(
-    `— оценка токенов: новый вопрос ≈ ${result.tokenEstimate.questionTokens}, весь стек ≈ ${result.tokenEstimate.contextTokens}\n`,
-  );
-  output.write(
-    `— API, финальный вызов: вход ${finalCall.promptTokens}, генерация ${finalCall.completionTokens} ` +
-      `(из них рассуждение ${finalCall.reasoningTokens})\n`,
-  );
-  if (summaryCall !== null) {
-    output.write(
-      `— API, summary: вход ${summaryCall.promptTokens}, генерация ${summaryCall.completionTokens}, всего ${summaryCall.totalTokens}\n`,
-    );
-  }
-  if (factsCall !== null) {
-    output.write(
-      `— API, facts: вход ${factsCall.promptTokens}, генерация ${factsCall.completionTokens}, всего ${factsCall.totalTokens}\n`,
-    );
-  }
-  output.write(`— расход токенов: ход ${turn.totalTokens}, сессия ${session.totalTokens}\n`);
-
-  if (result.finishReason === "length") {
-    output.write("— генерация остановилась по лимиту длины; ответ может быть неполным.\n");
-  }
-
-  if (!result.validation.ok)
-    output.write(`— формат не выдержан: ${result.validation.reason ?? "неизвестная причина"}\n`);
 }
 
 function messageOf(error: unknown): string {
