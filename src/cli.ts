@@ -3,6 +3,7 @@ import type { Readable, Writable } from "node:stream";
 import type { AgentResult, ContextStatus } from "./agent.ts";
 import { MEMORY_LAYERS, type MemoryLayer, type MemorySnapshot, type WritableMemoryLayer } from "./memory.ts";
 import { normalizeUserId, PROFILE_FIELDS, type ProfileField, USER_ID_RULE, type UserProfile } from "./profile.ts";
+import type { TaskView } from "./task.ts";
 
 export interface AgentPort {
   respond(input: string): Promise<AgentResult>;
@@ -16,6 +17,12 @@ export interface AgentPort {
   createBranch(name: string): void;
   switchBranch(name: string): void;
   listBranches(): Array<{ name: string; active: boolean; messageCount: number }>;
+  getTask(): TaskView | null;
+  startTask(description: string): void;
+  approveTask(): void;
+  pauseTask(): boolean;
+  resumeTask(): boolean;
+  clearTask(): boolean;
 }
 
 /** Агент выбранного пользователя и операции над каталогом профилей. */
@@ -47,6 +54,13 @@ const MEMORY_TITLES: Record<MemoryLayer, string> = {
   working: "Рабочая память (working) — условия текущей задачи",
   long: "Долговременная память (long) — сведения, предпочтения и знания",
 };
+const TASK_USAGE = {
+  start: "/task start описание",
+  approve: "/task approve",
+  pause: "/task pause",
+  resume: "/task resume",
+  clear: "/task clear",
+};
 const PROFILE_USAGE = {
   load: "/profile load userId",
   set: "/profile set style|constraints|context значение",
@@ -75,14 +89,20 @@ type ProfileWizard = { userId: null } | { userId: string; field: ProfileField; d
 const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.\n";
 const HELP = [
   "Диалог с агентом. Команды:",
-  "  /reset — очистить диалог выбранной стратегии и статистику; рабочая и долговременная память и профиль сохраняются",
+  "  /reset — очистить диалог выбранной стратегии и статистику; рабочая и долговременная память, профиль и задача сохраняются",
   "  /memory — показать все слои памяти",
   ...Object.values(MEMORY_USAGE).map((usage) => `  ${usage}`),
   "  /profile-init — создать или изменить профиль пошаговым опросом и выбрать пользователя",
   "  /profile — показать активного пользователя и профиль",
   ...Object.values(PROFILE_USAGE).map((usage) => `  ${usage}`),
+  "  /task — показать задачу: этап, план, результаты, проверку и ожидаемое действие",
+  "  /task start описание — создать задачу; модель начнёт работу со следующей реплики",
+  "  /task approve — утвердить предложенный план и перейти к выполнению",
+  "  /task pause — приостановить задачу: реплики пойдут в обычный чат",
+  "  /task resume — вернуть реплики в задачу",
+  "  /task clear — удалить задачу; /reset её не удаляет",
   "  /exit — завершить диалог",
-  "Новая задача: /reset, затем /memory clear working.",
+  "Новый разговор: /reset, затем /memory clear working. Задачу удаляет только /task clear.",
   "В branching: /checkpoint, /branch имя, /switch имя, /branches.",
 ].join("\n");
 
@@ -102,6 +122,7 @@ export async function runCli(agent: SessionPort, args: string[], io: CliIo): Pro
 async function runOnce(agent: AgentPort, question: string, io: CliIo): Promise<number> {
   try {
     writeResult(io.output, await agent.respond(question));
+    writeTaskTurnStatus(io.output, agent);
     return 0;
   } catch (error) {
     io.error.write(`Запрос не удался: ${messageOf(error)}\n`);
@@ -136,7 +157,7 @@ async function handleLine(agent: SessionPort, question: string, io: CliIo): Prom
   if (command === "/reset") {
     try {
       agent.reset();
-      io.output.write(RESET_MESSAGE);
+      writeReset(io.output, agent);
     } catch (error) {
       io.error.write(`Не удалось сбросить контекст: ${messageOf(error)}\n`);
     }
@@ -157,6 +178,7 @@ async function handleLine(agent: SessionPort, question: string, io: CliIo): Prom
     try {
       if (command === "/memory") runMemoryCommand(agent, question, io.output);
       else if (command === "/profile") runProfileCommand(agent, question, io.output);
+      else if (command === "/task") runTaskCommand(agent, question, io.output);
       else runBranchCommand(agent, question, io.output);
     } catch (error) {
       io.error.write(`Команда не выполнена: ${messageOf(error)}\n`);
@@ -166,6 +188,7 @@ async function handleLine(agent: SessionPort, question: string, io: CliIo): Prom
 
   try {
     writeResult(io.output, await agent.respond(question));
+    writeTaskTurnStatus(io.output, agent);
   } catch (error) {
     io.error.write(`Запрос не удался: ${messageOf(error)}\n`);
   }
@@ -290,6 +313,8 @@ function writeStatus(output: Writable, agent: SessionPort): void {
     `Пользователь: ${agent.getActiveUserId() ?? "не выбран"}\n` +
       `Контекст: ${status.strategy ?? "без стратегии"}${status.activeBranch === null ? "" : `, ветка: ${status.activeBranch}`}\n`,
   );
+  const task = agent.getTask();
+  if (task !== null) writeTaskStatus(output, task, { plan: true, question: true });
 }
 
 function writeProfile(output: Writable, agent: SessionPort): void {
@@ -302,8 +327,11 @@ function writeProfile(output: Writable, agent: SessionPort): void {
 }
 
 function writePrompt(output: Writable, agent: SessionPort, wizard: ProfileWizard | null): void {
-  if (wizard === null) output.write(`${agent.getActiveUserId() ?? "без профиля"} > `);
-  else output.write(wizard.userId === null ? "профиль > " : `профиль ${wizard.userId} > `);
+  if (wizard === null) {
+    const task = agent.getTask();
+    const target = task === null ? "" : task.status.paused ? " [чат, задача на паузе]" : " [задача]";
+    output.write(`${agent.getActiveUserId() ?? "без профиля"}${target} > `);
+  } else output.write(wizard.userId === null ? "профиль > " : `профиль ${wizard.userId} > `);
 }
 
 function runMemoryCommand(agent: AgentPort, input: string, output: Writable): void {
@@ -344,7 +372,8 @@ function runMemoryCommand(agent: AgentPort, input: string, output: Writable): vo
       const layer = memoryLayer(words[2], MEMORY_LAYERS, MEMORY_USAGE.clear);
       expectWordCount(words, 3, MEMORY_USAGE.clear);
       agent.clearMemory(layer);
-      output.write(layer === "short" ? RESET_MESSAGE : `Слой ${layer} очищен.\n`);
+      if (layer === "short") writeReset(output, agent);
+      else output.write(`Слой ${layer} очищен.\n`);
       break;
     }
     default:
@@ -373,6 +402,111 @@ function expectWordCount(words: string[], count: number, usage: string): void {
 
 function writeMemoryLayer(output: Writable, layer: MemoryLayer, value: MemorySnapshot[MemoryLayer]): void {
   output.write(`${MEMORY_TITLES[layer]}:\n${JSON.stringify(value, null, 2)}\n`);
+}
+
+function writeReset(output: Writable, agent: AgentPort): void {
+  output.write(RESET_MESSAGE);
+  if (agent.getTask() !== null) output.write("Задача не изменена: удалить её можно командой /task clear.\n");
+}
+
+function runTaskCommand(agent: AgentPort, input: string, output: Writable): void {
+  const words = input.split(/\s+/);
+  const action = words[1]?.toLowerCase();
+
+  switch (action) {
+    case undefined:
+      writeTask(output, agent.getTask());
+      return;
+    case "start":
+      if (words.length < 3) throw new Error(`Не хватает аргументов. Использование: ${TASK_USAGE.start}`);
+      // Описание — остаток строки после подкоманды, с исходным регистром и внутренними пробелами.
+      agent.startTask(input.replace(/^(?:\S+\s+){2}/, ""));
+      output.write("Задача создана. Модель начнёт работу по следующей реплике, например «Продолжай».\n");
+      break;
+    case "approve":
+      expectWordCount(words, 2, TASK_USAGE.approve);
+      agent.approveTask();
+      output.write("План утверждён. Первый шаг выполнится по следующей реплике, например «Продолжай».\n");
+      break;
+    case "pause":
+      expectWordCount(words, 2, TASK_USAGE.pause);
+      output.write(
+        agent.pauseTask()
+          ? "Задача приостановлена. Реплики идут в обычный чат; /task resume — вернуться к задаче.\n"
+          : "Задача уже на паузе.\n",
+      );
+      break;
+    case "resume": {
+      expectWordCount(words, 2, TASK_USAGE.resume);
+      output.write(agent.resumeTask() ? "Задача возобновлена.\n" : "Задача уже активна.\n");
+      const resumed = agent.getTask();
+      if (resumed !== null) writeTaskStatus(output, resumed, { plan: true, question: true });
+      return;
+    }
+    case "clear":
+      expectWordCount(words, 2, TASK_USAGE.clear);
+      output.write(
+        agent.clearTask()
+          ? "Задача удалена. Обычный диалог, профиль и память сохранены.\n"
+          : "Задачи нет, удалять нечего.\n",
+      );
+      return;
+    default:
+      throw new Error(
+        `Неизвестное действие задачи «${words[1]}». Использование: /task, ${Object.values(TASK_USAGE).join(", ")}`,
+      );
+  }
+  const task = agent.getTask();
+  if (task !== null) writeTaskStatus(output, task);
+}
+
+function writeTask(output: Writable, task: TaskView | null): void {
+  if (task === null) {
+    output.write(`Задачи нет. Создайте её командой ${TASK_USAGE.start}.\n`);
+    return;
+  }
+  const { context } = task;
+  const lines = [
+    `Описание задачи: ${context.task}`,
+    `Этап: ${context.state}`,
+    `Пауза: ${context.paused ? "да" : "нет"}`,
+  ];
+  lines.push(context.plan.length === 0 ? "План: ещё не предложен" : "План:");
+  context.plan.forEach((step, index) => {
+    lines.push(`  ${index + 1}. ${step}${index < context.results.length ? " — выполнен" : ""}`);
+  });
+  context.results.forEach((result, index) => {
+    lines.push(`Результат шага ${index + 1}:`, result);
+  });
+  if (context.review !== null) {
+    lines.push(context.review.passed ? "Проверка пройдена:" : "Замечания проверки:", context.review.text);
+  }
+  if (context.waitingFor !== null) lines.push("Вопрос агента:", context.waitingFor);
+  output.write(`${lines.join("\n")}\n`);
+  writeTaskStatus(output, task);
+}
+
+/** plan — черновик, ожидающий утверждения; question — открытый вопрос агента. Оба берутся из сохранённого состояния. */
+function writeTaskStatus(
+  output: Writable,
+  { context, status }: TaskView,
+  details: { plan?: boolean; question?: boolean } = {},
+): void {
+  if (details.plan && context.state === "planning" && context.plan.length > 0 && context.waitingFor === null) {
+    output.write(`План на утверждение:\n${context.plan.map((step, index) => `  ${index + 1}. ${step}`).join("\n")}\n`);
+  }
+  if (details.question && context.waitingFor !== null) output.write(`Вопрос агента: ${context.waitingFor}\n`);
+  output.write(
+    `Задача: ${status.state}${status.paused ? ", на паузе" : ""} — ${status.work}\n` +
+      `Ожидается: ${status.expectedAction}\n` +
+      `Следующая реплика: ${status.paused ? "в обычный чат" : "в задачу"}\n`,
+  );
+}
+
+/** Задача без паузы после ответа означает, что ход относился к ней. */
+function writeTaskTurnStatus(output: Writable, agent: AgentPort): void {
+  const task = agent.getTask();
+  if (task !== null && !task.status.paused) writeTaskStatus(output, task, { plan: true });
 }
 
 function runBranchCommand(agent: AgentPort, input: string, output: Writable): void {

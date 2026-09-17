@@ -4,6 +4,7 @@ import { type Agent, AgentBusyError, type AgentResult, type ContextStatus } from
 import type { ContextStrategy } from "./history.ts";
 import { JsonHistoryRepository } from "./json-history-repository.ts";
 import { JsonMemoryRepository } from "./json-memory-repository.ts";
+import { JsonTaskRepository } from "./json-task-repository.ts";
 import type { MemoryLayer, MemorySnapshot, WritableMemoryLayer } from "./memory.ts";
 import {
   normalizeUserId,
@@ -15,6 +16,7 @@ import {
   USER_ID_RULE,
   type UserProfile,
 } from "./profile.ts";
+import type { TaskView } from "./task.ts";
 
 export type AgentFactory = (userId: string | null, profileProvider: (() => UserProfile) | undefined) => Agent;
 
@@ -30,7 +32,7 @@ export function userDirectory(root: string, userId: string): string {
   return join(root, ".agent-users", createHash("sha256").update(userId, "utf8").digest("hex"));
 }
 
-/** Репозитории истории и памяти: корень рабочего каталога без пользователя или его личный каталог. */
+/** Репозитории истории, памяти и задачи: корень рабочего каталога без пользователя или его личный каталог. */
 export function jsonAgentRepositories(root: string, userId: string | null, contextStrategy: ContextStrategy) {
   const directory = userId === null ? root : userDirectory(root, userId);
   return {
@@ -44,6 +46,7 @@ export function jsonAgentRepositories(root: string, userId: string | null, conte
     ),
     workingMemoryRepository: new JsonMemoryRepository(join(directory, ".agent-memory.working.json"), "working"),
     longTermMemoryRepository: new JsonMemoryRepository(join(directory, ".agent-memory.long-term.json"), "long"),
+    taskRepository: new JsonTaskRepository(join(directory, ".agent-task.json")),
   };
 }
 
@@ -163,6 +166,30 @@ export class AgentSession {
 
   listBranches(): Array<{ name: string; active: boolean; messageCount: number }> {
     return this.agent.listBranches();
+  }
+
+  getTask(): TaskView | null {
+    return this.agent.getTask();
+  }
+
+  startTask(description: string): void {
+    this.agent.startTask(description);
+  }
+
+  approveTask(): void {
+    this.agent.approveTask();
+  }
+
+  pauseTask(): boolean {
+    return this.agent.pauseTask();
+  }
+
+  resumeTask(): boolean {
+    return this.agent.resumeTask();
+  }
+
+  clearTask(): boolean {
+    return this.agent.clearTask();
   }
 
   private agentFor(userId: string | null): Agent {

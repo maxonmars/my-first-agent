@@ -436,3 +436,139 @@ it("creates two users, switches between them and restores the selected user's co
   expect(readJson(userPath("Владимир", ".agent-history.sliding.json")).messages).toHaveLength(4);
   expect(readFileSync(historyPath, "utf8")).toBe(legacySource);
 });
+
+it("runs a task through a pause, an ordinary chat and a restart, sharing it with another strategy", () => {
+  const env = mockEnvironment();
+  const taskPath = join(workingDirectory, ".agent-task.json");
+  const plan = ["Определить допустимое содержание ответа", "Подготовить текст клиенту"];
+  const readTask = () => JSON.parse(readFileSync(taskPath, "utf8"));
+
+  const first = runProcess(
+    [],
+    "/task start Подготовить ответ клиенту о задержке заказа\nПродолжай\n/task approve\nПродолжай\n" +
+      "/task pause\nКороткий вопрос в чат\n/exit\n",
+    env,
+  );
+  expect(first.status).toBe(0);
+  expect(first.stderr).toBe("");
+  expect(first.stdout).toContain("без профиля [задача] > План из двух шагов.");
+  expect(first.stdout).toContain("без профиля [задача] > Результат шага 1");
+  expect(first.stdout).toContain("без профиля [чат, задача на паузе] > Чат без задачи.");
+  expect(first.stdout).toContain("ход 8, сессия 24");
+  expect(first.stdout).not.toContain("сессия 32");
+  expect(readTask()).toEqual({
+    context: {
+      task: "Подготовить ответ клиенту о задержке заказа",
+      state: "execution",
+      paused: true,
+      plan,
+      results: ["Результат шага 1"],
+      waitingFor: null,
+      review: null,
+    },
+    messages: [
+      { role: "user", content: "Продолжай" },
+      { role: "assistant", content: "План из двух шагов." },
+      { role: "user", content: "Продолжай" },
+      { role: "assistant", content: "Результат шага 1" },
+    ],
+  });
+  expect(readHistory()).toEqual({
+    kind: "sliding",
+    messages: [
+      { role: "user", content: "Короткий вопрос в чат" },
+      { role: "assistant", content: "Чат без задачи." },
+    ],
+  });
+
+  const second = runProcess([], "/task resume\nПродолжай\nПроверь\n/task\n/exit\n", env);
+  expect(second.status).toBe(0);
+  expect(second.stderr).toBe("");
+  expect(second.stdout).toContain(
+    "Контекст: sliding\nЗадача: execution, на паузе — шаг 2 из 2: Подготовить текст клиенту\n" +
+      "Ожидается: возобновить задачу командой /task resume\nСледующая реплика: в обычный чат\n",
+  );
+  expect(second.stdout).toContain("Результат шага 2\n");
+  expect(second.stdout).toContain("Задача: validation — проверка результатов\n");
+  expect(second.stdout).toContain("Проверка пройдена:\nСроков и компенсаций нет.\nЗадача: done — задача завершена\n");
+  expect(second.stdout).toContain("ход 8, сессия 16");
+  expect(readTask().context).toMatchObject({
+    state: "done",
+    paused: false,
+    results: ["Результат шага 1", "Результат шага 2"],
+    review: { passed: true, text: "Сроков и компенсаций нет." },
+  });
+  const done = readFileSync(taskPath, "utf8");
+
+  const branching = runProcess([], "/reset\n/exit\n", { ...env, AGENT_CONTEXT_STRATEGY: "branching" });
+  expect(branching.status).toBe(0);
+  expect(branching.stdout).toContain("Задача не изменена: удалить её можно командой /task clear.");
+  expect(readFileSync(taskPath, "utf8")).toBe(done);
+  const discussion = runProcess(["Что в итоге?"], undefined, { ...env, AGENT_CONTEXT_STRATEGY: "branching" });
+  expect(discussion.status).toBe(0);
+  expect(discussion.stderr).toBe("");
+  expect(discussion.stdout).toContain("Задача уже завершена.");
+  expect(readTask().messages).toHaveLength(10);
+  expect(readTask().context.state).toBe("done");
+  expect(
+    JSON.parse(readFileSync(join(workingDirectory, ".agent-history.branching.json"), "utf8")).branches.main,
+  ).toEqual([]);
+});
+
+it("shows the saved plan after the turn and restart, and the saved question after resume, without the model", () => {
+  const env = mockEnvironment();
+  const taskPath = join(workingDirectory, ".agent-task.json");
+  const plan = "План на утверждение:\n  1. Определить допустимое содержание ответа\n  2. Подготовить текст клиенту\n";
+
+  const first = runProcess([], "/task start Ответ клиенту о задержке заказа\nПродолжай\n/task pause\n/exit\n", env);
+  expect(first.status).toBe(0);
+  expect(first.stderr).toBe("");
+  expect(first.stdout).toContain(`ход 8, сессия 8\n${plan}Задача: planning — согласование плана\n`);
+
+  const second = runProcess([], "/task resume\n/exit\n", env);
+  expect(second.status).toBe(0);
+  expect(second.stdout).toContain(`Контекст: sliding\n${plan}Задача: planning, на паузе`);
+  expect(second.stdout).toContain(`Задача возобновлена.\n${plan}Задача: planning — согласование плана\n`);
+  expect(second.stdout).not.toContain("расход токенов");
+
+  const saved = JSON.parse(readFileSync(taskPath, "utf8"));
+  writeFileSync(
+    taskPath,
+    JSON.stringify({
+      ...saved,
+      context: { ...saved.context, plan: [], waitingFor: "Какой номер заказа?", paused: true },
+    }),
+  );
+  const third = runProcess([], "/task resume\n/exit\n", env);
+  expect(third.status).toBe(0);
+  expect(third.stderr).toBe("");
+  expect(third.stdout).toContain(
+    "Вопрос агента: Какой номер заказа?\nЗадача: planning, на паузе — сбор требований\n" +
+      "Ожидается: возобновить задачу командой /task resume\nСледующая реплика: в обычный чат\n",
+  );
+  expect(third.stdout).toContain(
+    "Задача возобновлена.\nВопрос агента: Какой номер заказа?\nЗадача: planning — сбор требований\n" +
+      "Ожидается: ответить на вопрос агента\nСледующая реплика: в задачу\n",
+  );
+  expect(third.stdout).not.toContain("расход токенов");
+  expect(JSON.parse(readFileSync(taskPath, "utf8")).context).toMatchObject({
+    waitingFor: "Какой номер заказа?",
+    paused: false,
+  });
+});
+
+it("stops on a corrupted task file without rewriting it", () => {
+  const taskPath = join(workingDirectory, ".agent-task.json");
+  const corrupted = '{"context":{"task":"личная задача"}';
+  writeFileSync(taskPath, corrupted);
+
+  const result = runProcess(["вопрос"], undefined, mockEnvironment());
+
+  expect(result.status).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toMatch(/^Не удалось загрузить задачу из «.+»: некорректный JSON\.\n$/);
+  expect(result.stderr).toContain(taskPath);
+  expect(result.stderr).not.toContain("личная");
+  expect(readFileSync(taskPath, "utf8")).toBe(corrupted);
+  expect(existsSync(historyPath)).toBe(false);
+});
