@@ -31,6 +31,22 @@ import {
   type UserProfile,
 } from "./profile.ts";
 import { META_INSTRUCTION, STRATEGIES, type StrategyName } from "./strategies.ts";
+import {
+  applyTaskReply,
+  approvePlan,
+  createTask,
+  parseTaskReply,
+  TASK_INSTRUCTION,
+  TASK_META_INSTRUCTION,
+  type TaskContext,
+  TaskError,
+  type TaskRepository,
+  type TaskSnapshot,
+  type TaskView,
+  taskDataBlock,
+  taskSnapshotProblem,
+  taskView,
+} from "./task.ts";
 import { estimateContextTokens, estimateTextTokens } from "./tokens.ts";
 
 export interface AgentConfig {
@@ -78,6 +94,7 @@ export interface AgentOptions {
   historyRepository?: HistoryRepository;
   workingMemoryRepository?: MemoryRepository;
   longTermMemoryRepository?: MemoryRepository;
+  taskRepository?: TaskRepository;
   /** Синхронный источник профиля; вызывается один раз в начале каждого respond(). */
   profileProvider?: () => UserProfile;
 }
@@ -101,6 +118,7 @@ interface TurnContext {
   summary: string | null;
   memory: WritableMemory;
   profile: UserProfile;
+  task: TaskContext | null;
 }
 
 export interface ContextStatus {
@@ -127,8 +145,10 @@ export class Agent {
   private readonly historyRepository: HistoryRepository | undefined;
   private readonly memoryRepositories: Record<WritableMemoryLayer, MemoryRepository | undefined>;
   private readonly profileProvider: (() => UserProfile) | undefined;
+  private readonly taskRepository: TaskRepository | undefined;
   private history: HistoryState;
   private memory: WritableMemory;
+  private task: TaskSnapshot | null;
   private sessionUsage: TokenUsage = emptyUsage();
   private busy = false;
 
@@ -147,6 +167,8 @@ export class Agent {
       working: structuredClone(this.memoryRepositories.working?.load() ?? {}),
       long: structuredClone(this.memoryRepositories.long?.load() ?? {}),
     };
+    this.taskRepository = options.taskRepository;
+    this.task = structuredClone(this.taskRepository?.load() ?? null);
   }
 
   async respond(input: string): Promise<AgentResult> {
@@ -158,10 +180,11 @@ export class Agent {
     this.busy = true;
 
     try {
+      let context = this.turnContext();
+      if (context.task !== null) return await this.respondTask(context, context.task, question);
       let turnUsage = emptyUsage();
       let factsCall: TokenUsage | null = null;
       let summaryCall: TokenUsage | null = null;
-      let context = this.turnContext();
       if (
         this.config.contextStrategy === "compression" &&
         context.messages.length - this.config.historyKeepLastMessages >= COMPRESSION_BATCH_MESSAGES
@@ -228,16 +251,8 @@ export class Agent {
         }
         context.facts = result.data;
       }
-      let extraInstruction = STRATEGIES[this.config.strategy];
-
-      if (this.config.strategy === "meta") {
-        const preparation = await this.complete(context, question, META_INSTRUCTION, false);
-        turnUsage = addUsage(turnUsage, preparation.usage);
-        extraInstruction = requireAnswer(preparation);
-      }
-
-      const completion = await this.complete(context, question, extraInstruction, true);
-      turnUsage = addUsage(turnUsage, completion.usage);
+      const { completion, usage } = await this.answer(context, question);
+      turnUsage = addUsage(turnUsage, usage);
       const text = requireAnswer(completion);
       const validation = FORMATS[this.config.format].validate(text);
 
@@ -258,25 +273,62 @@ export class Agent {
       }
       this.commit(nextHistory);
 
-      return {
-        text,
-        finishReason: completion.finishReason,
-        validation,
-        tokenEstimate: {
-          questionTokens: estimateTextTokens(question),
-          contextTokens: completion.contextTokens,
-        },
-        usage: {
-          summaryCall: summaryCall === null ? null : cloneUsage(summaryCall),
-          factsCall: factsCall === null ? null : cloneUsage(factsCall),
-          finalCall: cloneUsage(completion.usage),
-          turn: cloneUsage(turnUsage),
-          session: cloneUsage(this.sessionUsage),
-        },
-      };
+      return this.result(question, text, validation, completion, turnUsage, summaryCall, factsCall);
     } finally {
       this.busy = false;
     }
+  }
+
+  private async respondTask(context: TurnContext, task: TaskContext, question: string): Promise<AgentResult> {
+    const { completion, usage } = await this.answer(context, question);
+    const candidate = taskCandidate(task, context.messages, question, completion, this.config.format);
+    this.commitTask(candidate.snapshot);
+    return this.result(question, candidate.answer, candidate.validation, completion, usage, null, null);
+  }
+
+  /** Meta, если выбрана, и финальный вызов на одном снимке контекста. */
+  private async answer(
+    context: TurnContext,
+    question: string,
+  ): Promise<{ completion: CompletionResult; usage: TokenUsage }> {
+    let usage = emptyUsage();
+    let extraInstruction = STRATEGIES[this.config.strategy];
+
+    if (this.config.strategy === "meta") {
+      const preparation = await this.complete(context, question, META_INSTRUCTION, false);
+      usage = addUsage(usage, preparation.usage);
+      extraInstruction = requireAnswer(preparation);
+    }
+
+    const completion = await this.complete(context, question, extraInstruction, true);
+    return { completion, usage: addUsage(usage, completion.usage) };
+  }
+
+  private result(
+    question: string,
+    text: string,
+    validation: ValidationResult,
+    completion: CompletionResult,
+    turnUsage: TokenUsage,
+    summaryCall: TokenUsage | null,
+    factsCall: TokenUsage | null,
+  ): AgentResult {
+    return {
+      text,
+      finishReason: completion.finishReason,
+      validation,
+      tokenEstimate: {
+        questionTokens: estimateTextTokens(question),
+        contextTokens: completion.contextTokens,
+      },
+      usage: {
+        summaryCall: summaryCall === null ? null : cloneUsage(summaryCall),
+        factsCall: factsCall === null ? null : cloneUsage(factsCall),
+        finalCall: cloneUsage(completion.usage),
+        turn: cloneUsage(turnUsage),
+        session: cloneUsage(this.sessionUsage),
+      },
+    };
   }
 
   reset(): void {
@@ -356,6 +408,67 @@ export class Agent {
     }));
   }
 
+  getTask(): TaskView | null {
+    return this.task === null ? null : taskView(this.task.context);
+  }
+
+  startTask(description: string): void {
+    this.assertTaskIdle();
+    const next = createTask(description);
+    if (this.task !== null && this.task.context.state !== "done") {
+      throw new TaskError("Незавершённую задачу нельзя заменить: сначала удалите её командой /task clear.");
+    }
+    this.commitTask(next);
+  }
+
+  approveTask(): void {
+    const task = this.requireTask();
+    this.commitTask({ context: approvePlan(task.context), messages: structuredClone(task.messages) });
+  }
+
+  /** false — задача уже на паузе, запись не выполняется. */
+  pauseTask(): boolean {
+    return this.setTaskPaused(true);
+  }
+
+  /** false — задача уже активна, запись не выполняется. */
+  resumeTask(): boolean {
+    return this.setTaskPaused(false);
+  }
+
+  /** false — задачи нет, запись не выполняется. */
+  clearTask(): boolean {
+    this.assertTaskIdle();
+    if (this.task === null) return false;
+    this.commitTask(null);
+    return true;
+  }
+
+  private setTaskPaused(paused: boolean): boolean {
+    const task = this.requireTask();
+    if (task.context.paused === paused) return false;
+    this.commitTask({
+      context: { ...structuredClone(task.context), paused },
+      messages: structuredClone(task.messages),
+    });
+    return true;
+  }
+
+  private requireTask(): TaskSnapshot {
+    this.assertTaskIdle();
+    if (this.task === null) throw new TaskError("Задачи нет. Создайте её командой /task start описание.");
+    return this.task;
+  }
+
+  private assertTaskIdle(): void {
+    if (this.busy) throw new AgentBusyError("Нельзя менять задачу во время обработки запроса.");
+  }
+
+  private commitTask(snapshot: TaskSnapshot | null): void {
+    this.taskRepository?.save(structuredClone(snapshot));
+    this.task = snapshot;
+  }
+
   private requireBranching(): BranchingHistory {
     if (this.history.kind !== "branching")
       throw new AgentBranchError("Команды веток доступны только в режиме branching.");
@@ -388,9 +501,14 @@ export class Agent {
     this.memory = { ...this.memory, [layer]: entries };
   }
 
+  /** Активная задача без паузы заменяет контекст обычного диалога целиком. */
   private turnContext(): TurnContext {
     const memory = structuredClone(this.memory);
     const profile = structuredClone(this.profileProvider?.() ?? {});
+    if (this.task !== null && !this.task.context.paused) {
+      const { context, messages } = structuredClone(this.task);
+      return { messages, facts: null, summary: null, memory, profile, task: context };
+    }
     if (this.history.kind === "branching") {
       return {
         messages: structuredClone(this.history.branches[this.history.activeBranch]!),
@@ -398,6 +516,7 @@ export class Agent {
         summary: null,
         memory,
         profile,
+        task: null,
       };
     }
     if (this.history.kind === "compression") {
@@ -407,6 +526,7 @@ export class Agent {
         facts: null,
         memory,
         profile,
+        task: null,
       };
     }
     return {
@@ -415,6 +535,7 @@ export class Agent {
       facts: this.history.kind === "facts" ? { ...this.history.facts } : null,
       memory,
       profile,
+      task: null,
     };
   }
 
@@ -437,7 +558,9 @@ export class Agent {
         context === null
           ? ["Увеличьте maxInputTokens или очистите историю командой /reset."]
           : [
-              "Сократите вопрос или очистите историю командой /reset.",
+              context.task === null
+                ? "Сократите вопрос или очистите историю командой /reset."
+                : "Сократите вопрос. Контекст задачи не сжимается автоматически, а /reset его не очищает: при необходимости удалите задачу командой /task clear или приостановите её командой /task pause.",
               ...(hasMemory(context.memory)
                 ? [
                     "Рабочая и долговременная память тоже входят в запрос, а /reset их сохраняет: при необходимости сократите их командами /memory delete или /memory clear.",
@@ -478,20 +601,13 @@ export class Agent {
     const params: PreparedParams = {
       model: this.config.model,
       messages: [
-        {
-          role: "system",
-          content: this.buildSystemPrompt(
-            extraInstruction,
-            applyOutputPolicy,
-            hasMemory(context.memory),
-            !isProfileEmpty(context.profile),
-          ),
-        },
+        { role: "system", content: this.buildSystemPrompt(context, extraInstruction, applyOutputPolicy) },
         ...(isProfileEmpty(context.profile)
           ? []
           : [{ role: "user" as const, content: `${PROFILE_TITLE}\n${JSON.stringify(context.profile)}` }]),
         ...memoryMessages(LONG_TERM_MEMORY_TITLE, context.memory.long),
         ...memoryMessages(WORKING_MEMORY_TITLE, context.memory.working),
+        ...(context.task === null ? [] : [{ role: "user" as const, content: taskDataBlock(context.task) }]),
         ...(context.summary === null
           ? []
           : [
@@ -517,7 +633,9 @@ export class Agent {
     if (this.config.temperature !== null) params.temperature = this.config.temperature;
     if (!this.config.thinkingEnabled) params.thinking = { type: "disabled" };
 
-    if (applyOutputPolicy) {
+    // Stop marker может оборвать JSON-ответ задачи, поэтому в task-режиме он не передаётся.
+    if (applyOutputPolicy && context.task !== null) params.response_format = { type: "json_object" };
+    else if (applyOutputPolicy) {
       if (this.config.stopMarker !== null && this.config.format !== "json") params.stop = [this.config.stopMarker];
       if (this.config.format === "json") params.response_format = { type: "json_object" };
     }
@@ -525,21 +643,24 @@ export class Agent {
     return params;
   }
 
-  private buildSystemPrompt(
-    extraInstruction: string,
-    applyOutputPolicy: boolean,
-    withMemory: boolean,
-    withProfile: boolean,
-  ): string {
+  private buildSystemPrompt(context: TurnContext, extraInstruction: string, applyOutputPolicy: boolean): string {
+    const withProfile = !isProfileEmpty(context.profile);
     const blocks = [
       this.config.systemPrompt,
       withProfile ? PROFILE_INSTRUCTION : "",
-      withMemory ? MEMORY_INSTRUCTION : "",
+      hasMemory(context.memory) ? MEMORY_INSTRUCTION : "",
       extraInstruction,
       withProfile && !applyOutputPolicy ? PROFILE_META_INSTRUCTION : "",
     ];
 
-    if (applyOutputPolicy) {
+    if (context.task !== null) {
+      blocks.push(applyOutputPolicy ? TASK_INSTRUCTION : TASK_META_INSTRUCTION);
+      const format = FORMATS[this.config.format].instruction;
+      if (applyOutputPolicy && format.length > 0) blocks.push(`Требование к тексту в поле answer: ${format}`);
+      if (applyOutputPolicy && this.config.maxWords !== null) {
+        blocks.push(`Уложи текст поля answer в ${this.config.maxWords} слов.`);
+      }
+    } else if (applyOutputPolicy) {
       blocks.push(FORMATS[this.config.format].instruction);
 
       if (this.config.maxWords !== null) blocks.push(`Уложись в ${this.config.maxWords} слов.`);
@@ -622,6 +743,38 @@ function requireAnswer(completion: CompletionResult): string {
   }
 
   return completion.text;
+}
+
+/** Проверяет финальный ответ задачи и строит кандидат снимка; любое нарушение протокола — AgentResponseError. */
+function taskCandidate(
+  task: TaskContext,
+  messages: HistoryMessage[],
+  question: string,
+  completion: CompletionResult,
+  format: FormatName,
+): { answer: string; validation: ValidationResult; snapshot: TaskSnapshot } {
+  try {
+    if (completion.finishReason !== "stop") {
+      throw new TaskError(
+        completion.finishReason === "length" ? "ответ усечён по лимиту длины" : "генерация не завершилась штатно",
+      );
+    }
+    const reply = parseTaskReply(completion.text);
+    const validation = FORMATS[format].validate(reply.answer);
+    if (!validation.ok) throw new TaskError(`answer не соответствует формату ${format}: ${validation.reason}`);
+    const snapshot: TaskSnapshot = {
+      context: applyTaskReply(task, reply),
+      messages: [...messages, { role: "user", content: question }, { role: "assistant", content: reply.answer }],
+    };
+    const problem = taskSnapshotProblem(snapshot);
+    if (problem !== null) throw new TaskError(`несогласованное состояние, ${problem}`);
+    return { answer: reply.answer, validation, snapshot };
+  } catch (error) {
+    if (!(error instanceof TaskError)) throw error;
+    throw new AgentResponseError(
+      `Ответ модели для задачи отклонён: ${error.message} (finish_reason: ${completion.finishReason}).`,
+    );
+  }
 }
 
 function emptyUsage(): TokenUsage {

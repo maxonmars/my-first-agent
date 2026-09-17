@@ -1,6 +1,7 @@
 import { deepStrictEqual } from "node:assert/strict";
 import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, WORKING_MEMORY_TITLE } from "../../src/memory.ts";
 import { PROFILE_INSTRUCTION, PROFILE_TITLE } from "../../src/profile.ts";
+import { TASK_INSTRUCTION, TASK_TITLE } from "../../src/task.ts";
 
 const memoryBlocks = [
   { role: "user", content: `${LONG_TERM_MEMORY_TITLE}\n{"transport":"предпочитаю поезд"}` },
@@ -25,6 +26,7 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
   const request = JSON.parse(String(init?.body)) as {
     model: string;
     messages: Array<{ role: string; content: string }>;
+    response_format?: { type: string };
   };
   const question = request.messages.at(-1)?.content ?? "";
 
@@ -139,6 +141,34 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
       { role: "assistant", content: "Эхо: Код Макса — КЕДР" },
     ]);
     content = "Профиль Макса получен.";
+  }
+
+  if (request.messages[0]?.content.includes(TASK_INSTRUCTION)) {
+    const blockIndex = request.messages.findIndex((message) => message.content.startsWith(TASK_TITLE));
+    const task = JSON.parse(request.messages[blockIndex]!.content.slice(TASK_TITLE.length + 1));
+    const dialog = request.messages.slice(blockIndex + 1, -1);
+    deepStrictEqual(request.response_format, { type: "json_object" });
+    if (!task.task.includes("задерж")) throw new Error("Нет исходного описания задачи");
+    for (const result of task.results) {
+      if (!dialog.some((message) => message.role === "assistant" && message.content === result)) {
+        throw new Error("Результат шага не найден в переписке задачи");
+      }
+    }
+    const reply = {
+      planning: {
+        action: "propose_plan",
+        answer: "План из двух шагов.",
+        steps: ["Определить допустимое содержание ответа", "Подготовить текст клиенту"],
+      },
+      execution: { action: "complete_step", answer: `Результат шага ${task.status.step?.number}` },
+      validation: { action: "validation_pass", answer: "Сроков и компенсаций нет." },
+      done: { action: "reply", answer: "Задача уже завершена." },
+    }[task.state as string];
+    content = JSON.stringify(reply);
+  }
+  if (question === "Короткий вопрос в чат") {
+    deepStrictEqual(request.messages.slice(1), [{ role: "user", content: question }]);
+    content = "Чат без задачи.";
   }
 
   if (question === "Как меня зовут?") {

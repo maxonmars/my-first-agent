@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentResult } from "../src/agent.ts";
 import type { CliIo, SessionPort } from "../src/cli.ts";
 import { runCli } from "../src/cli.ts";
+import { type TaskContext, TaskError, type TaskView, taskView } from "../src/task.ts";
 
 function result(text: string, options: { valid?: boolean; total?: number } = {}): AgentResult {
   const total = options.total ?? 7;
@@ -62,6 +63,12 @@ function fakeAgent(replies: Array<AgentResult | Error>): SessionPort & {
   setProfileField: ReturnType<typeof vi.fn<SessionPort["setProfileField"]>>;
   deleteProfileField: ReturnType<typeof vi.fn<SessionPort["deleteProfileField"]>>;
   clearProfile: ReturnType<typeof vi.fn<SessionPort["clearProfile"]>>;
+  getTask: ReturnType<typeof vi.fn<SessionPort["getTask"]>>;
+  startTask: ReturnType<typeof vi.fn<SessionPort["startTask"]>>;
+  approveTask: ReturnType<typeof vi.fn<SessionPort["approveTask"]>>;
+  pauseTask: ReturnType<typeof vi.fn<SessionPort["pauseTask"]>>;
+  resumeTask: ReturnType<typeof vi.fn<SessionPort["resumeTask"]>>;
+  clearTask: ReturnType<typeof vi.fn<SessionPort["clearTask"]>>;
 } {
   let index = 0;
   const respond = vi.fn<SessionPort["respond"]>(async () => {
@@ -98,6 +105,12 @@ function fakeAgent(replies: Array<AgentResult | Error>): SessionPort & {
     createBranch: vi.fn(),
     switchBranch: vi.fn(),
     listBranches: vi.fn(() => [{ name: "main", active: true, messageCount: 0 }]),
+    getTask: vi.fn<SessionPort["getTask"]>(() => null),
+    startTask: vi.fn<SessionPort["startTask"]>(),
+    approveTask: vi.fn<SessionPort["approveTask"]>(),
+    pauseTask: vi.fn<SessionPort["pauseTask"]>(() => true),
+    resumeTask: vi.fn<SessionPort["resumeTask"]>(() => true),
+    clearTask: vi.fn<SessionPort["clearTask"]>(() => true),
   };
 }
 
@@ -151,7 +164,9 @@ describe("interactive CLI", () => {
     expect(agent.reset).toHaveBeenCalledOnce();
     expect(streams.output()).toContain(RESET_MESSAGE);
     expect(streams.output()).toContain("/memory set working|long ключ значение");
-    expect(streams.output()).toContain("Новая задача: /reset, затем /memory clear working.");
+    expect(streams.output()).toContain(
+      "Новый разговор: /reset, затем /memory clear working. Задачу удаляет только /task clear.",
+    );
   });
 
   it("continues the dialog after an agent error", async () => {
@@ -685,5 +700,322 @@ describe("profile commands", () => {
     expect(await runCli(agent, ["/profile", "load", "Владимир"], streams.io)).toBe(1);
     expect(streams.error()).toBe("Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n");
     expect(agent.switchUser).not.toHaveBeenCalled();
+  });
+});
+
+describe("task commands", () => {
+  const PLAN = ["Определить допустимое содержание ответа", "Подготовить текст клиенту"];
+
+  function view(overrides: Partial<TaskContext> = {}): TaskView {
+    return taskView({
+      task: "Ответить клиенту о задержке",
+      state: "planning",
+      paused: false,
+      plan: [],
+      results: [],
+      waitingFor: null,
+      review: null,
+      ...overrides,
+    });
+  }
+
+  /** Fake-агент с задачей, которую команды меняют как настоящий агент. */
+  function taskAgent(initial: TaskView | null, replies: AgentResult[] = []) {
+    const agent = fakeAgent(replies);
+    let current = initial;
+    const update = (overrides: Partial<TaskContext>) => {
+      current = view({ ...current!.context, ...overrides });
+    };
+    agent.getTask.mockImplementation(() => current);
+    agent.startTask.mockImplementation((description) => {
+      current = view({ task: description.trim() });
+    });
+    agent.approveTask.mockImplementation(() => update({ state: "execution" }));
+    agent.pauseTask.mockImplementation(() => {
+      if (current!.context.paused) return false;
+      update({ paused: true });
+      return true;
+    });
+    agent.resumeTask.mockImplementation(() => {
+      if (!current!.context.paused) return false;
+      update({ paused: false });
+      return true;
+    });
+    agent.clearTask.mockImplementation(() => {
+      const existed = current !== null;
+      current = null;
+      return existed;
+    });
+    return Object.assign(agent, {
+      setTask: (next: TaskView | null) => {
+        current = next;
+      },
+    });
+  }
+
+  it("prints the saved plan after a planning turn before the approval hint and updates it", async () => {
+    const agent = taskAgent(view());
+    agent.respond
+      .mockImplementationOnce(async () => {
+        agent.setTask(view({ plan: ["Уточнить допустимые обещания", "Написать ответ клиенту"] }));
+        return result("План готов.");
+      })
+      .mockImplementationOnce(async () => {
+        agent.setTask(view({ plan: ["Написать ответ клиенту без сроков"] }));
+        return result("План обновлён.");
+      });
+    const streams = capture("Продолжай\nУбери первый шаг\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    const [first, second] = streams.output().split("План обновлён.\n");
+    expect(first!.split("План готов.\n")[1]).toMatch(
+      /сессия 7\nПлан на утверждение:\n {2}1\. Уточнить допустимые обещания\n {2}2\. Написать ответ клиенту\n/,
+    );
+    expect(first).toContain(
+      "  2. Написать ответ клиенту\nЗадача: planning — согласование плана\n" +
+        "Ожидается: утвердить план командой /task approve или попросить изменить его\n",
+    );
+    expect(second).toContain("План на утверждение:\n  1. Написать ответ клиенту без сроков\nЗадача: planning");
+    expect(second).not.toContain("Уточнить допустимые обещания");
+    expect(agent.startTask).not.toHaveBeenCalled();
+    expect(streams.error()).toBe("");
+  });
+
+  it("shows a restored plan waiting for approval at startup and after resume without the model", async () => {
+    const agent = taskAgent(view({ plan: PLAN, paused: true }));
+    const streams = capture("/task resume\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    const plan = "План на утверждение:\n  1. Определить допустимое содержание ответа\n  2. Подготовить текст клиенту\n";
+    expect(streams.output()).toContain(
+      `Контекст: sliding\n${plan}Задача: planning, на паузе — согласование плана\n` +
+        "Ожидается: возобновить задачу командой /task resume\nСледующая реплика: в обычный чат\n",
+    );
+    expect(streams.output()).toContain(
+      `Задача возобновлена.\n${plan}Задача: planning — согласование плана\n` +
+        "Ожидается: утвердить план командой /task approve или попросить изменить его\nСледующая реплика: в задачу\n",
+    );
+    expect(agent.respond).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["planning", view({ waitingFor: "Какой номер заказа?", paused: true }), "сбор требований"],
+    [
+      "execution",
+      view({ state: "execution", plan: PLAN, waitingFor: "Какой номер заказа?", paused: true }),
+      "шаг 1 из 2: Определить допустимое содержание ответа",
+    ],
+  ])("shows the saved question in %s at startup and after resume", async (state, restored, work) => {
+    const agent = taskAgent(restored);
+    const streams = capture("/task resume\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.output()).toContain(
+      `Контекст: sliding\nВопрос агента: Какой номер заказа?\nЗадача: ${state}, на паузе — ${work}\n` +
+        "Ожидается: возобновить задачу командой /task resume\nСледующая реплика: в обычный чат\n",
+    );
+    expect(streams.output()).toContain(
+      `Задача возобновлена.\nВопрос агента: Какой номер заказа?\nЗадача: ${state} — ${work}\n` +
+        "Ожидается: ответить на вопрос агента\nСледующая реплика: в задачу\n",
+    );
+    expect(streams.output()).not.toContain("План на утверждение");
+    expect(agent.respond).not.toHaveBeenCalled();
+  });
+
+  it("prints the plan and the question once in the full /task view", async () => {
+    const planned = capture("/task\n/exit\n");
+    await runCli(taskAgent(view({ plan: PLAN })), [], planned.io);
+    const full = planned.output().split("Описание задачи:")[1]!.split("без профиля [задача] > ")[0]!;
+    expect(full.match(/Подготовить текст клиенту/g)).toHaveLength(1);
+    expect(full).not.toContain("План на утверждение");
+
+    const asked = capture("/task\n/exit\n");
+    await runCli(taskAgent(view({ waitingFor: "Какой номер заказа?" })), [], asked.io);
+    const questionView = asked.output().split("Описание задачи:")[1]!;
+    expect(questionView.match(/Какой номер заказа\?/g)).toHaveLength(1);
+  });
+
+  it("shows the task at startup and after a task turn, and marks where the next line goes", async () => {
+    const agent = taskAgent(view({ state: "execution", plan: PLAN, results: ["первый"] }), [result("второй шаг")]);
+    const streams = capture("Продолжай\n/task pause\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    const status =
+      "Задача: execution — шаг 2 из 2: Подготовить текст клиенту\n" +
+      "Ожидается: продолжить шаг 2 из 2\n" +
+      "Следующая реплика: в задачу\n";
+    const output = streams.output();
+    expect(output.startsWith(`Пользователь: не выбран\nКонтекст: sliding\n${status}`)).toBe(true);
+    expect(output).toContain("  /task start описание — создать задачу; модель начнёт работу со следующей реплики");
+    expect(output).toContain(`без профиля [задача] > второй шаг\n`);
+    expect(output.split("второй шаг\n")[1]).toContain(`ход 7, сессия 7\n${status}без профиля [задача] > `);
+    expect(output).toContain(
+      "Задача приостановлена. Реплики идут в обычный чат; /task resume — вернуться к задаче.\n" +
+        "Задача: execution, на паузе — шаг 2 из 2: Подготовить текст клиенту\n" +
+        "Ожидается: возобновить задачу командой /task resume\n" +
+        "Следующая реплика: в обычный чат\n" +
+        "без профиля [чат, задача на паузе] > ",
+    );
+    expect(agent.respond).toHaveBeenCalledExactlyOnceWith("Продолжай");
+    expect(streams.error()).toBe("");
+  });
+
+  it("keeps chat output unchanged during a pause and prints the task line in the one-shot status", async () => {
+    const paused = view({ plan: PLAN, paused: true });
+    const interactive = capture("вопрос в чат\n/exit\n");
+    await runCli(taskAgent(paused, [result("ответ чата")]), [], interactive.io);
+    expect(interactive.output()).toContain(
+      "без профиля [чат, задача на паузе] > ответ чата\n— оценка токенов: новый вопрос ≈ 2, весь стек ≈ 30\n",
+    );
+    expect(interactive.output().split("ответ чата\n")[1]).not.toContain("Задача:");
+
+    const oneShot = capture();
+    await runCli(taskAgent(view({ plan: PLAN }), [result("готово")]), ["Продолжай"], oneShot.io);
+    expect(oneShot.output()).toContain(
+      "Задача: planning — согласование плана\nОжидается: утвердить план командой /task approve или попросить изменить его\n",
+    );
+    expect(oneShot.output().split("готово\n")[1]).toContain("Следующая реплика: в задачу\n");
+  });
+
+  it("runs the commands locally with case-insensitive names and keeps the description as typed", async () => {
+    const agent = taskAgent(null);
+    const streams = capture(
+      "/task\n/TASK Start  Ответить  «Клиенту» о Задержке \n/Task APPROVE\n/task pause\n/task pause\n" +
+        "/task RESUME\n/task resume\n/task\n/task clear\n/task clear\n/exit\n",
+    );
+
+    await runCli(agent, [], streams.io);
+
+    expect(agent.startTask).toHaveBeenCalledExactlyOnceWith("Ответить  «Клиенту» о Задержке");
+    expect(agent.approveTask).toHaveBeenCalledOnce();
+    expect(agent.pauseTask).toHaveBeenCalledTimes(2);
+    expect(agent.resumeTask).toHaveBeenCalledTimes(2);
+    expect(agent.clearTask).toHaveBeenCalledTimes(2);
+    expect(agent.respond).not.toHaveBeenCalled();
+    const output = streams.output();
+    expect(output).toContain("без профиля > Задачи нет. Создайте её командой /task start описание.\n");
+    expect(output).toContain(
+      "Задача создана. Модель начнёт работу по следующей реплике, например «Продолжай».\n" +
+        "Задача: planning — сбор требований\n",
+    );
+    expect(output).toContain("План утверждён. Первый шаг выполнится по следующей реплике, например «Продолжай».");
+    expect(output).toContain("Задача уже на паузе.\n");
+    expect(output).toContain("Задача возобновлена.\n");
+    expect(output).toContain("Задача уже активна.\n");
+    expect(output).toContain("Задача удалена. Обычный диалог, профиль и память сохранены.\nбез профиля > ");
+    expect(output).toContain("Задачи нет, удалять нечего.\n");
+    expect(output.endsWith("без профиля > ")).toBe(true);
+    expect(streams.error()).toBe("");
+  });
+
+  it("shows the description, plan, results, review, question and expected action", async () => {
+    const agent = taskAgent(
+      view({
+        state: "execution",
+        plan: PLAN,
+        results: ["Нельзя обещать сроки.\nМожно извиниться."],
+        waitingFor: "Как зовут клиента?",
+        review: { passed: false, text: "Во втором шаге обещана компенсация." },
+      }),
+    );
+    const streams = capture("/task\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.output()).toContain(
+      "Описание задачи: Ответить клиенту о задержке\n" +
+        "Этап: execution\n" +
+        "Пауза: нет\n" +
+        "План:\n" +
+        "  1. Определить допустимое содержание ответа — выполнен\n" +
+        "  2. Подготовить текст клиенту\n" +
+        "Результат шага 1:\nНельзя обещать сроки.\nМожно извиниться.\n" +
+        "Замечания проверки:\nВо втором шаге обещана компенсация.\n" +
+        "Вопрос агента:\nКак зовут клиента?\n" +
+        "Задача: execution — шаг 2 из 2: Подготовить текст клиенту\n" +
+        "Ожидается: ответить на вопрос агента\n",
+    );
+    const done = capture("/task\n/exit\n");
+    await runCli(
+      taskAgent(view({ state: "done", plan: ["Шаг"], results: ["итог"], review: { passed: true, text: "ок" } })),
+      [],
+      done.io,
+    );
+    expect(done.output()).toContain(
+      "Проверка пройдена:\nок\nЗадача: done — задача завершена\nОжидается: обязательных действий нет\n",
+    );
+    const empty = capture("/task\n/exit\n");
+    await runCli(taskAgent(view()), [], empty.io);
+    expect(empty.output()).toContain("План: ещё не предложен\n");
+  });
+
+  it.each([
+    ["/task start", "Не хватает аргументов. Использование: /task start описание"],
+    ["/task approve now", "Лишние аргументы. Использование: /task approve"],
+    ["/task pause all", "Лишние аргументы. Использование: /task pause"],
+    ["/task resume 1", "Лишние аргументы. Использование: /task resume"],
+    ["/task clear all", "Лишние аргументы. Использование: /task clear"],
+    ["/task list", "Неизвестное действие задачи «list». Использование: /task, /task start описание"],
+  ])("reports %s with the syntax without calling the agent", async (command, reason) => {
+    const agent = taskAgent(view());
+    const streams = capture(`${command}\n/exit\n`);
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.error()).toBe(
+      `Команда не выполнена: ${reason}${command === "/task list" ? ", /task approve, /task pause, /task resume, /task clear" : ""}\n`,
+    );
+    for (const method of [
+      agent.respond,
+      agent.startTask,
+      agent.approveTask,
+      agent.pauseTask,
+      agent.resumeTask,
+      agent.clearTask,
+    ]) {
+      expect(method).not.toHaveBeenCalled();
+    }
+  });
+
+  it("reports failed task commands without a false success and continues", async () => {
+    const agent = taskAgent(view({ plan: PLAN, paused: true }), [result("ответ")]);
+    agent.approveTask.mockImplementationOnce(() => {
+      throw new TaskError("Задача на паузе: сначала выполните /task resume.");
+    });
+    agent.startTask.mockImplementationOnce(() => {
+      throw new TaskError("Незавершённую задачу нельзя заменить: сначала удалите её командой /task clear.");
+    });
+    const streams = capture("/task approve\n/task start новая\nвопрос\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.error()).toBe(
+      "Команда не выполнена: Задача на паузе: сначала выполните /task resume.\n" +
+        "Команда не выполнена: Незавершённую задачу нельзя заменить: сначала удалите её командой /task clear.\n",
+    );
+    expect(streams.output()).not.toContain("План утверждён");
+    expect(streams.output()).not.toContain("Задача создана");
+    expect(agent.respond).toHaveBeenCalledExactlyOnceWith("вопрос");
+  });
+
+  it("keeps the task on reset and names /task clear, rejects /task in one-shot mode", async () => {
+    const agent = taskAgent(view({ plan: PLAN }));
+    const streams = capture("/reset\n/memory clear short\n/exit\n");
+    await runCli(agent, [], streams.io);
+    expect(streams.output().match(/Задача не изменена: удалить её можно командой \/task clear\./g)).toHaveLength(2);
+    expect(agent.clearTask).not.toHaveBeenCalled();
+
+    const withoutTask = capture("/reset\n/exit\n");
+    await runCli(fakeAgent([]), [], withoutTask.io);
+    expect(withoutTask.output()).not.toContain("Задача не изменена");
+
+    const oneShot = capture();
+    expect(await runCli(agent, ["/task", "start", "описание"], oneShot.io)).toBe(1);
+    expect(oneShot.error()).toBe("Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n");
+    expect(agent.startTask).not.toHaveBeenCalled();
   });
 });

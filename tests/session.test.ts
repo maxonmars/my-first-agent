@@ -235,6 +235,7 @@ describe("user selection", () => {
     [".agent-history.sliding.json", "историю"],
     [".agent-memory.working.json", "память working"],
     [".agent-memory.long-term.json", "память long"],
+    [".agent-task.json", "задачу"],
   ])("does not switch when %s of the target user is corrupted", async (file, subject) => {
     const { session, save, calls } = setup();
     session.saveProfile("Владимир", vladimir);
@@ -437,6 +438,32 @@ describe("per-user files", () => {
       { role: "user", content: "Что я просил?" },
     ]);
     expect(JSON.stringify(calls[2])).not.toContain("Python");
+  });
+
+  it("keeps a separate task per user, loads it with the user's agent and never sends it to another user", async () => {
+    const plan = { content: JSON.stringify({ action: "propose_plan", answer: "План Макса", steps: ["Шаг Макса"] }) };
+    const { session, calls } = setup({ replies: [plan, { content: "ответ Владимиру" }] });
+    session.initProfile("Макс", maks);
+    session.startTask("Задача Макса");
+    await session.respond("Продолжай");
+
+    session.initProfile("Владимир", vladimir);
+    expect(session.getTask()).toBeNull();
+    expect(() => session.approveTask()).toThrow("Задачи нет");
+    await session.respond("Обычный вопрос");
+    expect(JSON.stringify(calls[1])).not.toContain("Макса");
+
+    session.switchUser("Макс");
+    expect(session.getTask()!.context).toMatchObject({ task: "Задача Макса", state: "planning", plan: ["Шаг Макса"] });
+    session.approveTask();
+    expect(session.pauseTask()).toBe(true);
+    expect(session.resumeTask()).toBe(true);
+    expect(session.getTask()!.status.state).toBe("execution");
+    expect(session.clearTask()).toBe(true);
+
+    expect(readFileSync(join(userDirectory(directory, "Макс"), ".agent-task.json"), "utf8")).toBe("null");
+    expect(existsSync(join(userDirectory(directory, "Владимир"), ".agent-task.json"))).toBe(false);
+    expect(existsSync(join(directory, ".agent-task.json"))).toBe(false);
   });
 
   it("isolates reset, branches, checkpoint and memory clearing between users", async () => {
