@@ -11,7 +11,18 @@ import {
 } from "../src/agent.ts";
 import { DEFAULT_AGENT_CONFIG } from "../src/config.ts";
 import type { HistoryMessage, HistoryRepository } from "../src/history.ts";
+import {
+  INVARIANTS_INSTRUCTION,
+  INVARIANTS_RETRY_TITLE,
+  type InvariantViolation,
+  invariantsBlock,
+  invariantsRetryInstruction,
+} from "../src/invariants.ts";
 import type { DeepSeekParams, LlmClient, LlmCompletion } from "../src/llm-client.ts";
+import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, WORKING_MEMORY_TITLE } from "../src/memory.ts";
+import { PROFILE_INSTRUCTION, PROFILE_TITLE } from "../src/profile.ts";
+import { SUPPORT_INVARIANTS } from "../src/support-invariants.ts";
+import { estimateContextTokens } from "../src/tokens.ts";
 import { completionResponse, type FakeReply, fakeClient, systemOf } from "./support/fake-client.ts";
 
 function config(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -788,4 +799,282 @@ describe("Agent token estimates and input budget", () => {
       expect(historyRepository.load).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("Agent invariants in the ordinary chat", () => {
+  const VIOLATING = "Заказ точно доставят завтра. Мы выплатим компенсацию 2 000 рублей.";
+  const CREDENTIALS = "Пришлите полный номер карты и CVV.";
+  const SAFE = "Точный срок пока уточняется, решение о компенсации принимает специалист.";
+  const REFUSAL =
+    "Не могу обещать срок доставки и компенсацию: это нарушает NoUnconfirmedDeadline и NoCompensationPromise. " +
+    "Предлагаю сообщить, что срок уточняется.";
+  const CONFLICT = "Пообещай доставку завтра и компенсацию 2 000 рублей.";
+  const [deadline, compensation] = SUPPORT_INVARIANTS.map(({ id, description }) => ({ id, description }));
+
+  function setup(replies: Array<FakeReply | Error>, overrides: Partial<AgentConfig> = {}) {
+    const fake = fakeClient(replies);
+    const historyRepository = fakeHistory();
+    const agent = new Agent({
+      client: fake.client,
+      config: config(overrides),
+      historyRepository,
+      invariants: SUPPORT_INVARIANTS,
+    });
+    return { ...fake, agent, historyRepository };
+  }
+
+  function retrySystem(first: DeepSeekParams, violations: InvariantViolation[]): string {
+    return `${systemOf(first)}\n\n${invariantsRetryInstruction(violations)}`;
+  }
+
+  it("keeps requests, calls and saves unchanged without invariants or with an empty list", async () => {
+    const runs = [undefined, []].map((invariants) => {
+      const fake = fakeClient([{ content: VIOLATING }, { content: "второй" }]);
+      const historyRepository = fakeHistory();
+      const agent = new Agent({
+        client: fake.client,
+        config: config({ strategy: "steps" }),
+        historyRepository,
+        ...(invariants === undefined ? {} : { invariants }),
+      });
+      return { ...fake, agent, historyRepository };
+    });
+
+    for (const run of runs) {
+      await run.agent.respond("первый вопрос");
+      await run.agent.respond("второй вопрос");
+      expect(run.agent.getInvariants()).toEqual([]);
+    }
+
+    expect(runs[1]!.calls).toEqual(runs[0]!.calls);
+    expect(runs[0]!.calls).toHaveLength(2);
+    expect(JSON.stringify(runs[0]!.calls)).not.toContain(INVARIANTS_INSTRUCTION);
+    expect(runs[1]!.historyRepository.save.mock.calls).toEqual(runs[0]!.historyRepository.save.mock.calls);
+  });
+
+  it("puts the invariants block after the profile and before memory, and the instruction after the profile one", async () => {
+    const fake = fakeClient([{ content: SAFE }]);
+    const agent = new Agent({
+      client: fake.client,
+      config: config(),
+      historyRepository: fakeHistory([
+        { role: "user", content: "прошлый вопрос" },
+        { role: "assistant", content: "прошлый ответ" },
+      ]),
+      profileProvider: () => ({ context: "Оператор поддержки" }),
+      workingMemoryRepository: { load: () => ({ order: "A-17" }), save: vi.fn() },
+      longTermMemoryRepository: { load: () => ({ tone: "вежливо" }), save: vi.fn() },
+      invariants: SUPPORT_INVARIANTS,
+    });
+
+    await agent.respond("вопрос");
+
+    expect(fake.calls[0]!.messages).toEqual([
+      {
+        role: "system",
+        content: `${DEFAULT_AGENT_CONFIG.systemPrompt}\n\n${PROFILE_INSTRUCTION}\n\n${INVARIANTS_INSTRUCTION}\n\n${MEMORY_INSTRUCTION}`,
+      },
+      { role: "user", content: `${PROFILE_TITLE}\n{"context":"Оператор поддержки"}` },
+      { role: "user", content: invariantsBlock(SUPPORT_INVARIANTS) },
+      { role: "user", content: `${LONG_TERM_MEMORY_TITLE}\n{"tone":"вежливо"}` },
+      { role: "user", content: `${WORKING_MEMORY_TITLE}\n{"order":"A-17"}` },
+      { role: "user", content: "прошлый вопрос" },
+      { role: "assistant", content: "прошлый ответ" },
+      { role: "user", content: "вопрос" },
+    ]);
+  });
+
+  it.each([
+    ["a compliant answer", "Как дела с заказом?", SAFE],
+    ["an explicit refusal of a conflicting request", CONFLICT, REFUSAL],
+  ])("saves %s from the first attempt without a retry", async (_name, question, answer) => {
+    const { agent, calls, historyRepository } = setup([{ content: answer, totalTokens: 5 }]);
+
+    const result = await agent.respond(question);
+
+    expect(calls).toHaveLength(1);
+    expect(systemOf(calls[0]!)).not.toContain(INVARIANTS_RETRY_TITLE);
+    expect(result.text).toBe(answer);
+    expect(result.usage.turn).toEqual(result.usage.finalCall);
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
+      kind: "sliding",
+      messages: [
+        { role: "user", content: question },
+        { role: "assistant", content: answer },
+      ],
+    });
+  });
+
+  it("regenerates once on the same snapshot, saves only the accepted answer and counts both calls", async () => {
+    const { agent, calls, historyRepository } = setup(
+      [
+        { content: VIOLATING, promptTokens: 10, completionTokens: 4, reasoningTokens: 1, totalTokens: 14 },
+        { content: REFUSAL, promptTokens: 12, completionTokens: 5, reasoningTokens: 2, totalTokens: 17 },
+        { content: SAFE, totalTokens: 3 },
+      ],
+      { maxWords: 50, stopMarker: "<END>" },
+    );
+
+    const result = await agent.respond(CONFLICT);
+
+    expect(calls).toHaveLength(2);
+    const [first, retry] = calls;
+    expect(retry!.messages.slice(1)).toEqual(first!.messages.slice(1));
+    expect(systemOf(retry!)).toBe(retrySystem(first!, [deadline!, compensation!]));
+    expect(systemOf(retry!)).toContain("Уложись в 50 слов.");
+    expect(retry!.stop).toEqual(["<END>"]);
+    expect(JSON.stringify(retry)).not.toContain("выплатим");
+    expect(result.text).toBe(REFUSAL);
+    expect(result.tokenEstimate.contextTokens).toBe(
+      estimateContextTokens(retry!.messages as Array<{ content: string }>),
+    );
+    expect(result.usage).toEqual({
+      factsCall: null,
+      summaryCall: null,
+      finalCall: { promptTokens: 12, completionTokens: 5, reasoningTokens: 2, totalTokens: 17 },
+      turn: { promptTokens: 22, completionTokens: 9, reasoningTokens: 3, totalTokens: 31 },
+      session: { promptTokens: 22, completionTokens: 9, reasoningTokens: 3, totalTokens: 31 },
+    });
+    expect(historyRepository.save).toHaveBeenCalledExactlyOnceWith({
+      kind: "sliding",
+      messages: [
+        { role: "user", content: CONFLICT },
+        { role: "assistant", content: REFUSAL },
+      ],
+    });
+
+    await agent.respond("Что дальше?");
+    expect(calls[2]!.messages).toContainEqual({ role: "assistant", content: REFUSAL });
+    expect(JSON.stringify(calls[2])).not.toContain("выплатим");
+    expect(systemOf(calls[2]!)).not.toContain(INVARIANTS_RETRY_TITLE);
+  });
+
+  it("rejects a second violation naming only its rules, saves nothing and releases busy", async () => {
+    const { agent, calls, historyRepository } = setup([
+      { content: VIOLATING, totalTokens: 7 },
+      { content: CREDENTIALS, totalTokens: 9 },
+      { content: SAFE, totalTokens: 3 },
+    ]);
+
+    const refusal = agent.respond(CONFLICT);
+
+    await expect(refusal).rejects.toThrow(
+      new AgentResponseError(
+        "Ответ модели отклонён: повторная генерация тоже нарушает инварианты NoPaymentCredentialsRequest. Ответ не сохранён.",
+      ),
+    );
+    await expect(refusal).rejects.not.toThrow("CVV");
+    expect(calls).toHaveLength(2);
+    expect(systemOf(calls[1]!)).toBe(retrySystem(calls[0]!, [deadline!, compensation!]));
+    expect(historyRepository.save).not.toHaveBeenCalled();
+    expect(agent.getMemory().short).toEqual({ kind: "sliding", messages: [] });
+
+    const next = await agent.respond(CONFLICT);
+    expect(calls[2]!.messages).toEqual(calls[0]!.messages);
+    expect(next.usage.turn.totalTokens).toBe(3);
+    expect(next.usage.session.totalTokens).toBe(19);
+    expect(() => agent.reset()).not.toThrow();
+  });
+
+  it.each<[string, FakeReply | Error, number]>([
+    ["a transport error", new Error("API недоступен"), 0],
+    ["an empty answer", { content: " ", totalTokens: 4 }, 4],
+  ])("does not retry after %s", async (_name, failure, spent) => {
+    const { agent, calls, historyRepository } = setup([failure, { content: SAFE, totalTokens: 3 }]);
+
+    await expect(agent.respond(CONFLICT)).rejects.toThrow();
+
+    expect(calls).toHaveLength(1);
+    expect(historyRepository.save).not.toHaveBeenCalled();
+    const next = await agent.respond(CONFLICT);
+    expect(calls[1]!.messages).toEqual(calls[0]!.messages);
+    expect(next.usage.session.totalTokens).toBe(spent + 3);
+  });
+
+  it("blocks a retry over the input budget, keeps the first usage and the previous state", async () => {
+    const probe = setup([{ content: SAFE }]);
+    await probe.agent.respond(CONFLICT);
+    const limit = estimateContextTokens(probe.calls[0]!.messages as Array<{ content: string }>);
+    const { agent, calls, historyRepository } = setup(
+      [
+        { content: VIOLATING, totalTokens: 7 },
+        { content: SAFE, totalTokens: 3 },
+      ],
+      { maxInputTokens: limit },
+    );
+
+    const refusal = agent.respond(CONFLICT);
+
+    await expect(refusal).rejects.toBeInstanceOf(AgentContextLimitError);
+    await expect(refusal).rejects.toThrow(`Этап «повторный ответ»: оценка входного контекста ≈`);
+    await expect(refusal).rejects.toThrow(`превышает установленный лимит ${limit}.`);
+    await expect(refusal).rejects.toThrow("Обязательные инварианты тоже входят в запрос и не очищаются через /reset.");
+    expect(calls).toHaveLength(1);
+    expect(historyRepository.save).not.toHaveBeenCalled();
+    const next = await agent.respond(CONFLICT);
+    expect(next.usage.session.totalTokens).toBe(10);
+    expect(next.tokenEstimate.contextTokens).toBe(limit);
+  });
+
+  it("keeps the previous history when saving the accepted retry fails", async () => {
+    const { agent, calls, historyRepository } = setup([
+      { content: VIOLATING, totalTokens: 7 },
+      { content: REFUSAL, totalTokens: 9 },
+      { content: SAFE, totalTokens: 3 },
+    ]);
+    historyRepository.save.mockImplementationOnce(() => {
+      throw new Error("Нет места для истории");
+    });
+
+    await expect(agent.respond(CONFLICT)).rejects.toThrow("Нет места для истории");
+
+    expect(agent.getMemory().short).toEqual({ kind: "sliding", messages: [] });
+    const next = await agent.respond("Что дальше?");
+    expect(calls[2]!.messages.slice(-1)).toEqual([{ role: "user", content: "Что дальше?" }]);
+    expect(calls[2]!.messages).not.toContainEqual({ role: "assistant", content: REFUSAL });
+    expect(next.usage.session.totalTokens).toBe(19);
+  });
+
+  it("holds busy through the retry and releases it after the accepted answer", async () => {
+    let release!: (response: LlmCompletion) => void;
+    const calls: DeepSeekParams[] = [];
+    const client: LlmClient = {
+      async create(params) {
+        calls.push(params);
+        if (calls.length === 1) return completionResponse(params, { content: VIOLATING });
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      },
+    };
+    const historyRepository = fakeHistory();
+    const agent = new Agent({ client, config: config(), historyRepository, invariants: SUPPORT_INVARIANTS });
+
+    const turn = agent.respond(CONFLICT);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+
+    await expect(agent.respond("параллельно")).rejects.toBeInstanceOf(AgentBusyError);
+    expect(() => agent.reset()).toThrow(AgentBusyError);
+    expect(() => agent.setMemory("working", "order", "A-17")).toThrow(AgentBusyError);
+    expect(agent.getInvariants()).toHaveLength(4);
+    release(completionResponse(calls[1]!, { content: REFUSAL }));
+    await expect(turn).resolves.toMatchObject({ text: REFUSAL });
+    expect(historyRepository.save).toHaveBeenCalledOnce();
+    expect(() => agent.reset()).not.toThrow();
+  });
+
+  it("owns a copy of the invariants and returns independent plain objects", () => {
+    const invariants = [...SUPPORT_INVARIANTS];
+    const agent = new Agent({ client: fakeClient([]).client, config: config(), invariants });
+    invariants.pop();
+
+    const listed = agent.getInvariants();
+    expect(listed).toEqual(SUPPORT_INVARIANTS.map(({ id, description }) => ({ id, description })));
+    listed[0]!.description = "изменено";
+    listed.pop();
+
+    expect(agent.getInvariants()).toHaveLength(4);
+    expect(agent.getInvariants()[0]!.description).toBe(SUPPORT_INVARIANTS[0]!.description);
+    expect(agent.getInvariants()[0]).not.toHaveProperty("check");
+  });
 });

@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { formatCount } from "../src/cli-view.ts";
+import { DEFAULT_AGENT_CONFIG } from "../src/config.ts";
+import { INVARIANTS_INSTRUCTION, invariantsBlock } from "../src/invariants.ts";
+import { SUPPORT_INVARIANTS } from "../src/support-invariants.ts";
+import { estimateTextTokens } from "../src/tokens.ts";
 
 const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 const mockApi = fileURLToPath(new URL("./support/mock-api.ts", import.meta.url));
@@ -11,8 +16,13 @@ let workingDirectory: string;
 let historyPath: string;
 const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.";
 const HEADER = "── my-first-agent ──\n\nПрофиль: без профиля\nКонтекст: sliding\n";
-const COMMANDS_HINT = "Команды: /help · /task · /memory · /profile\n";
+const COMMANDS_HINT = "Команды: /help · /task · /memory · /profile · /invariants\n";
 const PAUSE_HINT = "Далее → /task resume, чтобы вернуться к задаче; сейчас реплики идут в обычный чат";
+
+/** Оценка system и блока инвариантов, которые рабочий агент добавляет к запросу без профиля и памяти. */
+const BASE_CONTEXT =
+  estimateTextTokens(`${DEFAULT_AGENT_CONFIG.systemPrompt}\n\n${INVARIANTS_INSTRUCTION}`) +
+  estimateTextTokens(invariantsBlock(SUPPORT_INVARIANTS));
 
 function stateBlock(lines: string[]): string {
   return `\n── Состояние задачи ──\n\n${lines.join("\n")}\n`;
@@ -72,7 +82,7 @@ describe("CLI process", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toBe(
       `${HEADER}\n── Ответ агента ──\n\nЭхо: проверка связи\n` +
-        "\n── Токены ──\n\nОценка ≈ вопрос 4 · контекст 16\nAPI, финал: вход 5 · генерация 3\n" +
+        `\n── Токены ──\n\nОценка ≈ вопрос 4 · контекст ${formatCount(BASE_CONTEXT + 4)}\nAPI, финал: вход 5 · генерация 3\n` +
         "Из генерации: рассуждение 1\nХод 8 · сессия 8\n",
     );
     expect(result.stderr).toBe("");
@@ -185,13 +195,17 @@ describe("CLI process", () => {
 });
 
 it("blocks growing history locally and recovers through interactive reset", () => {
-  const env = { ...mockEnvironment(), AGENT_MAX_INPUT_TOKENS: "17" };
+  // Лимит пропускает два хода «abcd» поверх обязательных system и инвариантов, третий блокирует.
+  const limit = BASE_CONTEXT + 5;
+  const env = { ...mockEnvironment(), AGENT_MAX_INPUT_TOKENS: String(limit) };
   const result = runProcess([], "abcd\nabcd\nabcd\n/reset\nabcd\n/exit\n", env);
   expect(result.status).toBe(0);
   expect(result.stdout.match(/Эхо: abcd/g)).toHaveLength(3);
-  expect(result.stdout.match(/Оценка ≈ вопрос 1 · контекст 13/g)).toHaveLength(2);
-  expect(result.stdout).toContain("Оценка ≈ вопрос 1 · контекст 17");
-  expect(result.stderr).toMatch(/^Ошибка · Запрос не удался: .*≈ 21 токенов превышает установленный лимит 17/);
+  expect(result.stdout.split(`Оценка ≈ вопрос 1 · контекст ${formatCount(BASE_CONTEXT + 1)}\n`)).toHaveLength(3);
+  expect(result.stdout).toContain(`Оценка ≈ вопрос 1 · контекст ${formatCount(limit)}\n`);
+  expect(result.stderr.startsWith("Ошибка · Запрос не удался: ")).toBe(true);
+  expect(result.stderr).toContain(`≈ ${BASE_CONTEXT + 9} токенов превышает установленный лимит ${limit}.`);
+  expect(result.stderr).toContain("Обязательные инварианты тоже входят в запрос и не очищаются через /reset.");
   expect(result.stdout).toContain("Ход 8 · сессия 16");
   expect(result.stdout.split(RESET_MESSAGE)[1]).toContain("Ход 8 · сессия 8");
   expect(readHistory()).toEqual({
@@ -205,7 +219,7 @@ it("blocks growing history locally and recovers through interactive reset", () =
   const blocked = runProcess(["x".repeat(100)], undefined, env);
   expect(blocked.status).toBe(1);
   expect(blocked.stdout).toBe(HEADER);
-  expect(blocked.stderr).toContain("превышает установленный лимит 17");
+  expect(blocked.stderr).toContain(`превышает установленный лимит ${limit}`);
   expect(readFileSync(historyPath, "utf8")).toBe(beforeRefusal);
 });
 
@@ -710,4 +724,41 @@ it("stops on a corrupted task file without rewriting it", () => {
   expect(result.stderr).not.toContain("личная");
   expect(readFileSync(taskPath, "utf8")).toBe(corrupted);
   expect(existsSync(historyPath)).toBe(false);
+});
+
+it("replays the invariants video script: shows the rules and returns only the refusal after one retry", () => {
+  const env = mockEnvironment();
+  const delay =
+    "Подготовь вежливый ответ клиенту: заказ задерживается, точный срок пока неизвестен. Попроси номер заказа для проверки статуса.";
+  const conflict =
+    "Напиши, что заказ точно доставят завтра. Пообещай компенсацию 2 000 рублей и попроси полный номер карты и CVV.";
+  const followUp = "Почему ты отказался и что можно сообщить клиенту вместо этого?";
+  const refusal =
+    "Не могу это написать: просьба нарушает NoUnconfirmedDeadline, NoCompensationPromise и NoPaymentCredentialsRequest. " +
+    "Предлагаю сообщить клиенту, что срок уточняется, и для проверки статуса попросить номер заказа.";
+
+  const result = runProcess([], `/invariants\n${delay}\n${conflict}\n${followUp}\n/exit\n`, env);
+
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(result.stdout).toContain(
+    `без профиля > \n── Инварианты ──\n\nОбязательные правила ответа: общие для всех профилей, режимов и задач, командами не меняются.\n${SUPPORT_INVARIANTS.map(({ id, description }) => `${id}: ${description}`).join("\n")}\n\nбез профиля > `,
+  );
+  const [, conflictTurn] = result.stdout.split(`Эхо: ${delay}\n`);
+  expect(conflictTurn).toContain(`\n── Ответ агента ──\n\n${refusal}\n\n── Токены ──\n`);
+  expect(conflictTurn).toContain("API, финал: вход 5 · генерация 3\nИз генерации: рассуждение 1\nХод 16 · сессия 24\n");
+  expect(result.stdout).toContain("Ход 8 · сессия 32");
+  expect(result.stdout).not.toContain("выплатим");
+  expect(readHistory()).toEqual({
+    kind: "sliding",
+    messages: [
+      { role: "user", content: delay },
+      { role: "assistant", content: `Эхо: ${delay}` },
+      { role: "user", content: conflict },
+      { role: "assistant", content: refusal },
+      { role: "user", content: followUp },
+      { role: "assistant", content: `Эхо: ${followUp}` },
+    ],
+  });
+  expect(readdirSync(workingDirectory)).toEqual([".agent-history.sliding.json"]);
 });

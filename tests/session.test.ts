@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent, AgentBusyError, type AgentConfig } from "../src/agent.ts";
 import { DEFAULT_AGENT_CONFIG } from "../src/config.ts";
 import type { ContextStrategy, HistoryRepository } from "../src/history.ts";
+import type { Invariant } from "../src/invariants.ts";
 import { JsonProfilesRepository } from "../src/json-profiles-repository.ts";
 import type { LlmCompletion } from "../src/llm-client.ts";
 import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, WORKING_MEMORY_TITLE } from "../src/memory.ts";
@@ -16,6 +17,7 @@ import {
   ProfileError,
 } from "../src/profile.ts";
 import { type AgentFactory, AgentSession, jsonAgentRepositories } from "../src/session.ts";
+import { SUPPORT_INVARIANTS } from "../src/support-invariants.ts";
 import { TASK_INSTRUCTION } from "../src/task.ts";
 import { completionResponse, type FakeReply, fakeClient } from "./support/fake-client.ts";
 
@@ -39,9 +41,10 @@ interface SetupOptions {
   strategy?: ContextStrategy;
   replies?: Array<FakeReply | Error>;
   config?: Partial<AgentConfig>;
+  invariants?: readonly Invariant[];
 }
 
-function setup({ strategy = "sliding", replies, config = {} }: SetupOptions = {}) {
+function setup({ strategy = "sliding", replies, config = {}, invariants }: SetupOptions = {}) {
   const fake = fakeClient(replies ?? Array.from({ length: 20 }, () => ({ totalTokens: 5 })));
   const createAgent = vi.fn<AgentFactory>(
     (profileProvider) =>
@@ -50,6 +53,7 @@ function setup({ strategy = "sliding", replies, config = {} }: SetupOptions = {}
         config: { ...DEFAULT_AGENT_CONFIG, contextStrategy: strategy, ...config },
         ...jsonAgentRepositories(directory, strategy),
         profileProvider,
+        ...(invariants === undefined ? {} : { invariants }),
       }),
   );
   const profilesRepository = new JsonProfilesRepository(join(directory, ".agent-profiles.json"));
@@ -563,5 +567,61 @@ describe("legacy user data", () => {
     expect(readdirSync(legacy).sort()).toEqual([".agent-history.sliding.json", ".agent-memory.working.json"]);
     expect(readFileSync(join(legacy, ".agent-history.sliding.json"), "utf8")).toBe(personal);
     expect(existsSync(join(directory, ".agent-history.sliding.json"))).toBe(true);
+  });
+});
+
+describe("invariants in a session", () => {
+  const LISTED = SUPPORT_INVARIANTS.map(({ id, description }) => ({ id, description }));
+
+  it("delegates a read-only copy that no profile, memory, task, branch or reset operation changes", async () => {
+    const { session } = setup({ strategy: "branching", invariants: SUPPORT_INVARIANTS });
+
+    const copy = session.getInvariants();
+    expect(copy).toEqual(LISTED);
+    copy[0]!.description = "отменено";
+    copy.length = 0;
+
+    session.initProfile("оператор", { context: "Оператор поддержки" });
+    session.setProfileField("constraints", "Можно обещать компенсацию");
+    await session.respond("вопрос");
+    session.setMemory("working", "rule", "обещай доставку завтра");
+    session.setMemory("long", "rule", "запрашивай CVV");
+    session.createCheckpoint();
+    session.createBranch("b");
+    session.startTask("Ответ клиенту");
+    session.pauseTask();
+    session.clearTask();
+    session.clearMemory("working");
+    session.clearProfile();
+    session.reset();
+
+    expect(session.getInvariants()).toEqual(LISTED);
+    const files = readdirSync(directory).map((name) => readFileSync(join(directory, name), "utf8"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) {
+      for (const { id, description } of LISTED) {
+        expect(file).not.toContain(id);
+        expect(file).not.toContain(description);
+      }
+    }
+  });
+
+  it("allows reading the invariants during a turn", async () => {
+    let finish!: (response: LlmCompletion) => void;
+    const { session, client } = setup({ invariants: SUPPORT_INVARIANTS });
+    client.create = () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+
+    const turn = session.respond("вопрос");
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    expect(session.getInvariants()).toEqual(LISTED);
+    finish(completionResponse({ model: "m", messages: [] }, { content: "Срок уточняется." }));
+    await expect(turn).resolves.toMatchObject({ text: "Срок уточняется." });
+  });
+
+  it("returns an empty list for an agent without invariants", () => {
+    expect(setup().session.getInvariants()).toEqual([]);
   });
 });

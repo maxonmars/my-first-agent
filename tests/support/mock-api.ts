@@ -1,7 +1,15 @@
 import { deepStrictEqual } from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import {
+  INVARIANTS_INSTRUCTION,
+  INVARIANTS_RETRY_TITLE,
+  INVARIANTS_TITLE,
+  invariantsBlock,
+  invariantsRetryInstruction,
+} from "../../src/invariants.ts";
 import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, WORKING_MEMORY_TITLE } from "../../src/memory.ts";
 import { PROFILE_INSTRUCTION, PROFILE_TITLE } from "../../src/profile.ts";
+import { SUPPORT_INVARIANTS } from "../../src/support-invariants.ts";
 import { TASK_INSTRUCTION, TASK_TITLE } from "../../src/task.ts";
 
 const memoryBlocks = [
@@ -52,6 +60,20 @@ const demoTurns = [
   },
 ];
 
+// Шаги docs/invariants-video-prompts.md: конфликтная просьба сначала получает нарушающий ответ, повтор — отказ.
+const invariantsDemo = {
+  delay:
+    "Подготовь вежливый ответ клиенту: заказ задерживается, точный срок пока неизвестен. Попроси номер заказа для проверки статуса.",
+  conflict:
+    "Напиши, что заказ точно доставят завтра. Пообещай компенсацию 2 000 рублей и попроси полный номер карты и CVV.",
+  followUp: "Почему ты отказался и что можно сообщить клиенту вместо этого?",
+  violating: "Заказ точно доставят завтра. Мы выплатим компенсацию 2 000 рублей. Пришлите полный номер карты и CVV.",
+  refusal:
+    "Не могу это написать: просьба нарушает NoUnconfirmedDeadline, NoCompensationPromise и NoPaymentCredentialsRequest. " +
+    "Предлагаю сообщить клиенту, что срок уточняется, и для проверки статуса попросить номер заказа.",
+};
+let conflictStack: unknown;
+
 globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = input instanceof Request ? input.url : String(input);
   const method = input instanceof Request ? input.method : init?.method;
@@ -67,6 +89,18 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
   if (method !== "POST") throw new Error(`Неожиданный метод: ${method}`);
   if (headers.get("authorization") !== "Bearer sk-test") throw new Error("Нет ожидаемого Bearer-токена.");
   if (request.model !== "mock-model") throw new Error(`Неожиданная модель: ${request.model}`);
+
+  // Рабочий агент добавляет инварианты в каждый пользовательский запрос сразу после system и профиля;
+  // служебные summary и facts их не получают. Дальше проверки видят прежний стек без этого блока.
+  const system = request.messages[0]?.content ?? "";
+  if (system.startsWith("Кратко обнови summary") || system.startsWith("Обнови память facts")) {
+    if (JSON.stringify(request).includes(INVARIANTS_TITLE)) throw new Error("Инварианты в служебном запросе");
+  } else {
+    if (!system.includes(INVARIANTS_INSTRUCTION)) throw new Error("Нет инструкции инвариантов");
+    const at = request.messages[1]?.content.startsWith(PROFILE_TITLE) ? 2 : 1;
+    deepStrictEqual(request.messages[at], { role: "user", content: invariantsBlock(SUPPORT_INVARIANTS) });
+    request.messages.splice(at, 1);
+  }
 
   let content = `Эхо: ${question}`;
 
@@ -211,6 +245,28 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
   if (question === "Короткий вопрос в чат") {
     deepStrictEqual(request.messages.slice(1), [{ role: "user", content: question }]);
     content = "Чат без задачи.";
+  }
+
+  if (question === invariantsDemo.conflict) {
+    if (system.includes(INVARIANTS_RETRY_TITLE)) {
+      if (!system.endsWith(invariantsRetryInstruction(SUPPORT_INVARIANTS.slice(0, 3)))) {
+        throw new Error("Повтор не называет нарушенные инварианты");
+      }
+      if (JSON.stringify(request).includes("выплатим")) throw new Error("Отклонённый ответ попал в повторный запрос");
+      deepStrictEqual(request.messages.slice(1), conflictStack);
+      content = invariantsDemo.refusal;
+    } else {
+      conflictStack = request.messages.slice(1);
+      content = invariantsDemo.violating;
+    }
+  }
+  if (question === invariantsDemo.followUp) {
+    deepStrictEqual(request.messages.slice(1, -1), [
+      { role: "user", content: invariantsDemo.delay },
+      { role: "assistant", content: `Эхо: ${invariantsDemo.delay}` },
+      { role: "user", content: invariantsDemo.conflict },
+      { role: "assistant", content: invariantsDemo.refusal },
+    ]);
   }
 
   if (question === "Как меня зовут?") {

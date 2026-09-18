@@ -7,6 +7,7 @@ import {
   printBranches,
   printError,
   printHelp,
+  printInvariants,
   printMemoryLayer,
   printNotice,
   printProfile,
@@ -20,6 +21,7 @@ import {
   printTaskState,
   printWarning,
 } from "./cli-view.ts";
+import type { InvariantInfo } from "./invariants.ts";
 import { MEMORY_LAYERS, type MemoryLayer, type MemorySnapshot, type WritableMemoryLayer } from "./memory.ts";
 import {
   type AgentProfile,
@@ -34,6 +36,7 @@ export interface AgentPort {
   respond(input: string): Promise<AgentResult>;
   reset(): void;
   getContextStatus(): ContextStatus;
+  getInvariants(): InvariantInfo[];
   getMemory(): MemorySnapshot;
   setMemory(layer: WritableMemoryLayer, key: string, value: string): void;
   deleteMemory(layer: WritableMemoryLayer, key: string): boolean;
@@ -158,6 +161,13 @@ const HELP: readonly HelpGroup[] = [
     ],
   },
   {
+    title: "Инварианты",
+    lines: [
+      "Обязательные правила ответа: общие для всех профилей, режимов, веток и задач; команды их не меняют.",
+      ["/invariants", "показать активные инварианты"],
+    ],
+  },
+  {
     title: "Ветки",
     lines: [
       "Только в режиме branching: AGENT_CONTEXT_STRATEGY=branching.",
@@ -238,6 +248,7 @@ async function handleLine(agent: SessionPort, question: string, io: CliIo): Prom
   if (question.startsWith("/")) {
     try {
       if (command === "/help") runHelpCommand(question, io.output);
+      else if (command === "/invariants") runInvariantsCommand(agent, question, io.output);
       else if (command === "/memory") runMemoryCommand(agent, question, io.output);
       else if (command === "/profile") runProfileCommand(agent, question, io.output);
       else if (command === "/task") runTaskCommand(agent, question, io.output);
@@ -260,6 +271,11 @@ async function handleLine(agent: SessionPort, question: string, io: CliIo): Prom
 function runHelpCommand(input: string, output: Writable): void {
   expectWordCount(input.split(/\s+/), 1, "/help");
   printHelp(output, HELP);
+}
+
+function runInvariantsCommand(agent: AgentPort, input: string, output: Writable): void {
+  expectWordCount(input.split(/\s+/), 1, "/invariants");
+  printInvariants(output, agent.getInvariants());
 }
 
 function stepWizard(
