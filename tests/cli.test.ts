@@ -5,6 +5,7 @@ import type { AgentResult } from "../src/agent.ts";
 import type { CliIo, SessionPort } from "../src/cli.ts";
 import { runCli } from "../src/cli.ts";
 import { formatCount } from "../src/cli-view.ts";
+import type { InvariantInfo } from "../src/invariants.ts";
 import { type TaskContext, TaskError, type TaskView, taskView } from "../src/task.ts";
 
 const COLOR_VARIABLES = ["FORCE_COLOR", "NO_COLOR", "NODE_DISABLE_COLORS"] as const;
@@ -94,7 +95,7 @@ function expectClosedStyles(text: string): void {
 }
 
 const HEADER = "── my-first-agent ──\n\nПрофиль: без профиля\nКонтекст: sliding\n";
-const COMMANDS_HINT = "Команды: /help · /task · /memory · /profile\n";
+const COMMANDS_HINT = "Команды: /help · /task · /memory · /profile · /invariants\n";
 const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.";
 const PAUSE_HINT = "Далее → /task resume, чтобы вернуться к задаче; сейчас реплики идут в обычный чат";
 
@@ -111,6 +112,7 @@ function tokensBlock(total = 7): string {
 function fakeAgent(replies: Array<AgentResult | Error>): SessionPort & {
   respond: ReturnType<typeof vi.fn<SessionPort["respond"]>>;
   reset: ReturnType<typeof vi.fn<SessionPort["reset"]>>;
+  getInvariants: ReturnType<typeof vi.fn<SessionPort["getInvariants"]>>;
   getMemory: ReturnType<typeof vi.fn<SessionPort["getMemory"]>>;
   setMemory: ReturnType<typeof vi.fn<SessionPort["setMemory"]>>;
   deleteMemory: ReturnType<typeof vi.fn<SessionPort["deleteMemory"]>>;
@@ -150,6 +152,7 @@ function fakeAgent(replies: Array<AgentResult | Error>): SessionPort & {
     respond,
     reset,
     getContextStatus: () => ({ strategy: "sliding", activeBranch: null }),
+    getInvariants: vi.fn<SessionPort["getInvariants"]>(() => structuredClone(INVARIANTS)),
     getMemory: vi.fn<SessionPort["getMemory"]>(() => ({
       short: { kind: "sliding", messages: [] },
       working: {},
@@ -204,6 +207,10 @@ function mutatingMethods(agent: ReturnType<typeof fakeAgent>) {
 }
 
 const PLAN = ["Определить допустимое содержание ответа", "Подготовить текст клиенту"];
+const INVARIANTS: InvariantInfo[] = [
+  { id: "NoUnconfirmedDeadline", description: "Не обещать неподтверждённый срок доставки." },
+  { id: "MaxWordsInvariant", description: "Ответ пользователю — не больше 120 слов." },
+];
 
 function view(overrides: Partial<TaskContext> = {}): TaskView {
   return taskView({
@@ -378,6 +385,7 @@ describe("help", () => {
         "/profile clear",
       ],
     ],
+    ["Инварианты", ["/invariants"]],
     ["Ветки", ["/checkpoint", "/branch имя", "/switch имя", "/branches"]],
   ];
 
@@ -404,9 +412,11 @@ describe("help", () => {
     expect(help).toContain("Новый разговор: /reset, затем /memory clear working — рабочая память очищается отдельно.");
     expect(help).toContain("Задачу удаляет только /task clear.");
     expect(help).toContain("история, память и задача общие для всех профилей");
-    expect(help.slice(starts[4])).toContain("Только в режиме branching");
+    expect(help.slice(starts[4], starts[5])).toContain("общие для всех профилей, режимов, веток и задач");
+    expect(help.slice(starts[5])).toContain("Только в режиме branching");
     for (const method of [
       ...mutatingMethods(agent),
+      agent.getInvariants,
       agent.getMemory,
       agent.loadProfile,
       agent.listProfileIds,
@@ -432,6 +442,57 @@ describe("help", () => {
     expect(oneShot.error()).toBe(
       "Ошибка · Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n",
     );
+    for (const method of mutatingMethods(agent)) expect(method).not.toHaveBeenCalled();
+  });
+});
+
+describe("invariants command", () => {
+  it("lists the active invariants without the model, writes or usage and accepts any case", async () => {
+    const agent = fakeAgent([]);
+    const streams = capture("/invariants\n/INVARIANTS\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    const block =
+      "\n── Инварианты ──\n\n" +
+      "Обязательные правила ответа: общие для всех профилей, режимов и задач, командами не меняются.\n" +
+      "NoUnconfirmedDeadline: Не обещать неподтверждённый срок доставки.\n" +
+      "MaxWordsInvariant: Ответ пользователю — не больше 120 слов.\n";
+    expect(streams.output()).toBe(
+      `${HEADER}${COMMANDS_HINT}\nбез профиля > ${block}\nбез профиля > ${block}\nбез профиля > `,
+    );
+    expect(streams.error()).toBe("");
+    expect(agent.getInvariants).toHaveBeenCalledTimes(2);
+    for (const method of mutatingMethods(agent)) expect(method).not.toHaveBeenCalled();
+  });
+
+  it("shows an empty list as a note", async () => {
+    const agent = fakeAgent([]);
+    agent.getInvariants.mockReturnValue([]);
+    const streams = capture("/invariants\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.output()).toContain("командами не меняются.\nИнвариантов нет.\n");
+  });
+
+  it("rejects arguments, the one-shot mode and the command inside /profile-init", async () => {
+    const agent = fakeAgent([]);
+    const streams = capture("/invariants off\n/profile-init\n/invariants\n/cancel\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    expect(streams.error()).toBe("Ошибка · Команда не выполнена: Лишние аргументы. Использование: /invariants\n");
+    expect(streams.output()).toContain("Во время настройки профиля команды не выполняются");
+    expect(streams.output()).not.toContain("── Инварианты ──");
+
+    const oneShot = capture();
+    expect(await runCli(agent, ["/invariants"], oneShot.io)).toBe(1);
+    expect(oneShot.output()).toBe(HEADER);
+    expect(oneShot.error()).toBe(
+      "Ошибка · Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n",
+    );
+    expect(agent.getInvariants).not.toHaveBeenCalled();
     for (const method of mutatingMethods(agent)) expect(method).not.toHaveBeenCalled();
   });
 });
@@ -1562,7 +1623,7 @@ it("keeps block headings within 40 columns of a narrow terminal", async () => {
   agent.getActiveProfileId.mockReturnValue("редактор");
   agent.getContextStatus = () => ({ strategy: "branching", activeBranch: "main" });
   const streams = capture(
-    "/help\n/task\n/memory\n/profile\n/branches\nвопрос\n/profile-init\nредактор\n/cancel\n/task pause\n/exit\n",
+    "/help\n/task\n/memory\n/profile\n/invariants\n/branches\nвопрос\n/profile-init\nредактор\n/cancel\n/task pause\n/exit\n",
   );
 
   await runCli(agent, [], streams.io);

@@ -1,6 +1,7 @@
 import type { Writable } from "node:stream";
 import { styleText } from "node:util";
 import type { AgentResult, ContextStatus, TokenUsage } from "./agent.ts";
+import type { InvariantInfo } from "./invariants.ts";
 import type { MemoryEntries, MemoryLayer, MemorySnapshot } from "./memory.ts";
 import type { AgentProfile } from "./profile.ts";
 import type { TaskContext, TaskState, TaskView } from "./task.ts";
@@ -80,7 +81,8 @@ export function printSession(
     `${paint(output, "muted", "Профиль:")} ${paint(output, "user", profileId ?? "без профиля")}\n` +
       `${paint(output, "muted", "Контекст:")} ${context.strategy ?? "без стратегии"}${branch}\n`,
   );
-  if (options.commandsHint) output.write(`${paint(output, "muted", "Команды: /help · /task · /memory · /profile")}\n`);
+  if (options.commandsHint)
+    output.write(`${paint(output, "muted", "Команды: /help · /task · /memory · /profile · /invariants")}\n`);
 }
 
 export function printPrompt(output: Writable, text: string): void {
@@ -282,6 +284,19 @@ function entryLines(output: Writable, entries: Readonly<Record<string, string>>,
   const keys = Object.keys(entries);
   if (keys.length === 0) return [paint(output, "muted", empty)];
   return keys.map((key) => `${paint(output, "key", `${key}:`)} ${entries[key]}`);
+}
+
+export function printInvariants(output: Writable, invariants: readonly InvariantInfo[]): void {
+  printBlock(output, "Инварианты", [
+    paint(
+      output,
+      "muted",
+      "Обязательные правила ответа: общие для всех профилей, режимов и задач, командами не меняются.",
+    ),
+    ...(invariants.length === 0
+      ? [paint(output, "muted", "Инвариантов нет.")]
+      : invariants.map(({ id, description }) => `${paint(output, "key", `${id}:`)} ${description}`)),
+  ]);
 }
 
 export function printBranches(

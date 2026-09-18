@@ -6,6 +6,7 @@ import { runCli } from "./cli.ts";
 import { DEEPSEEK_BASE_URL, readConfig } from "./config.ts";
 import { JsonProfilesRepository } from "./json-profiles-repository.ts";
 import { AgentSession, jsonAgentRepositories } from "./session.ts";
+import { SUPPORT_INVARIANTS } from "./support-invariants.ts";
 
 try {
   const config = readConfig();
@@ -24,6 +25,7 @@ try {
         config: config.agent,
         ...jsonAgentRepositories(root, config.agent.contextStrategy),
         profileProvider,
+        invariants: SUPPORT_INVARIANTS,
       }),
   });
 

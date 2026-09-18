@@ -12,11 +12,20 @@ import {
 } from "../src/agent.ts";
 import { DEFAULT_AGENT_CONFIG } from "../src/config.ts";
 import { emptyHistory, type HistoryRepository, type HistoryState } from "../src/history.ts";
+import {
+  INVARIANTS_INSTRUCTION,
+  INVARIANTS_META_INSTRUCTION,
+  type Invariant,
+  invariantsBlock,
+  invariantsRetryInstruction,
+} from "../src/invariants.ts";
 import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, type MemoryEntries, WORKING_MEMORY_TITLE } from "../src/memory.ts";
 import { type AgentProfile, PROFILE_INSTRUCTION, PROFILE_TITLE } from "../src/profile.ts";
 import { jsonAgentRepositories } from "../src/session.ts";
+import { SUPPORT_INVARIANTS } from "../src/support-invariants.ts";
 import {
   TASK_INSTRUCTION,
+  TASK_INVARIANTS_INSTRUCTION,
   TASK_META_INSTRUCTION,
   type TaskContext,
   TaskError,
@@ -68,9 +77,19 @@ interface SetupOptions {
   provider?: () => AgentProfile;
   working?: MemoryEntries;
   long?: MemoryEntries;
+  invariants?: readonly Invariant[];
 }
 
-function setup({ initial = null, replies = [], config = {}, history, provider, working, long }: SetupOptions = {}) {
+function setup({
+  initial = null,
+  replies = [],
+  config = {},
+  history,
+  provider,
+  working,
+  long,
+  invariants,
+}: SetupOptions = {}) {
   const fake = fakeClient(replies);
   const state = history ?? emptyHistory("sliding");
   const historyRepository = {
@@ -90,6 +109,7 @@ function setup({ initial = null, replies = [], config = {}, history, provider, w
     ...(provider === undefined ? {} : { profileProvider: provider }),
     ...(working === undefined ? {} : { workingMemoryRepository: memory(working) }),
     ...(long === undefined ? {} : { longTermMemoryRepository: memory(long) }),
+    ...(invariants === undefined ? {} : { invariants }),
   });
   return { ...fake, agent, historyRepository, taskRepository };
 }
@@ -590,6 +610,161 @@ describe("rejected task turns", () => {
   });
 });
 
+describe("task turns with invariants", () => {
+  const [deadline, compensation] = SUPPORT_INVARIANTS.map(({ id, description }) => ({ id, description }));
+  const PROMISE_STEP = json({ action: "complete_step", answer: "Мы доставим заказ завтра и вернём 2 000 рублей." });
+  const REFUSAL = json({
+    action: "reply",
+    answer: "Не могу обещать срок и компенсацию: это нарушает NoUnconfirmedDeadline и NoCompensationPromise.",
+  });
+  const lastStep = task({ state: "execution", plan: PLAN, results: ["первый"] }, pair("Продолжай", "первый"));
+
+  it("adds the block and the conflict rule to the task request and keeps JSON mode", async () => {
+    const { agent, calls } = setup({
+      initial: lastStep,
+      replies: [REPLY.step2],
+      config: { stopMarker: "<END>" },
+      invariants: SUPPORT_INVARIANTS,
+    });
+
+    await agent.respond("Продолжай");
+
+    expect(calls[0]!.messages).toEqual([
+      {
+        role: "system",
+        content: `${DEFAULT_AGENT_CONFIG.systemPrompt}\n\n${INVARIANTS_INSTRUCTION}\n\n${TASK_INSTRUCTION}\n\n${TASK_INVARIANTS_INSTRUCTION}`,
+      },
+      { role: "user", content: invariantsBlock(SUPPORT_INVARIANTS) },
+      taskBlock(lastStep.context),
+      ...lastStep.messages,
+      { role: "user", content: "Продолжай" },
+    ]);
+    expect(calls[0]!.response_format).toEqual({ type: "json_object" });
+    expect(calls[0]).not.toHaveProperty("stop");
+  });
+
+  it("checks answer, retries from the original snapshot and commits the accepted step once", async () => {
+    const { agent, calls, taskRepository } = setup({
+      initial: lastStep,
+      replies: [PROMISE_STEP, REPLY.step2],
+      invariants: SUPPORT_INVARIANTS,
+    });
+
+    const result = await agent.respond("Продолжай");
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.messages.slice(1)).toEqual(calls[0]!.messages.slice(1));
+    expect(calls[1]!.messages).toContainEqual(taskBlock(lastStep.context));
+    expect(systemOf(calls[1]!)).toBe(
+      `${systemOf(calls[0]!)}\n\n${invariantsRetryInstruction([deadline!, compensation!])}`,
+    );
+    expect(calls[1]!.response_format).toEqual({ type: "json_object" });
+    expect(JSON.stringify(calls[1])).not.toContain("вернём");
+    expect(result.text).toBe("Здравствуйте! Приносим извинения за задержку.");
+    expect(result.usage.finalCall.totalTokens).toBe(5);
+    expect(result.usage.turn.totalTokens).toBe(10);
+    expect(taskRepository.save).toHaveBeenCalledExactlyOnceWith(
+      task({ state: "validation", plan: PLAN, results: ["первый", "Здравствуйте! Приносим извинения за задержку."] }, [
+        ...lastStep.messages,
+        ...pair("Продолжай", "Здравствуйте! Приносим извинения за задержку."),
+      ]),
+    );
+  });
+
+  it("checks the steps of a proposed plan", async () => {
+    const promisingPlan = json({
+      action: "propose_plan",
+      answer: "План из двух шагов.",
+      steps: ["Извиниться за задержку", "Написать клиенту, что мы доставим заказ завтра"],
+    });
+    const { agent, calls, taskRepository } = setup({
+      initial: task(),
+      replies: [promisingPlan, REPLY.plan],
+      invariants: SUPPORT_INVARIANTS,
+    });
+
+    await agent.respond("Продолжай");
+
+    expect(calls).toHaveLength(2);
+    expect(systemOf(calls[1]!)).toContain(invariantsRetryInstruction([deadline!]));
+    expect(taskRepository.save).toHaveBeenCalledExactlyOnceWith(
+      task({ plan: PLAN }, pair("Продолжай", "Предлагаю два шага.")),
+    );
+  });
+
+  it("answers a conflicting request with reply and does not complete the step", async () => {
+    const { agent, calls, taskRepository } = setup({
+      initial: lastStep,
+      replies: [PROMISE_STEP, REFUSAL],
+      invariants: SUPPORT_INVARIANTS,
+    });
+
+    const result = await agent.respond("Пообещай доставку завтра и компенсацию");
+
+    expect(calls).toHaveLength(2);
+    expect(result.text).toContain("Не могу обещать срок и компенсацию");
+    expect(agent.getTask()!.context).toEqual(lastStep.context);
+    expect(taskRepository.save).toHaveBeenCalledExactlyOnceWith(
+      task(lastStep.context, [
+        ...lastStep.messages,
+        ...pair("Пообещай доставку завтра и компенсацию", JSON.parse(String(REFUSAL.content)).answer),
+      ]),
+    );
+  });
+
+  it.each<{ name: string; replies: FakeReply[]; reason: string; calls: number }>([
+    {
+      name: "a protocol error before the invariants",
+      replies: [json({ action: "validation_pass", answer: "Мы доставим заказ завтра." })],
+      reason: "действие validation_pass недопустимо на этапе execution",
+      calls: 1,
+    },
+    {
+      name: "a protocol error in the retry",
+      replies: [PROMISE_STEP, { content: '{"action":"reply"', totalTokens: 5 }],
+      reason: "некорректный JSON",
+      calls: 2,
+    },
+    {
+      name: "a second violation",
+      replies: [PROMISE_STEP, PROMISE_STEP],
+      reason: "повторная генерация тоже нарушает инварианты NoUnconfirmedDeadline, NoCompensationPromise",
+      calls: 2,
+    },
+  ])("rejects $name without advancing the task", async ({ replies, reason, calls: count }) => {
+    const { agent, calls, taskRepository } = setup({ initial: lastStep, replies, invariants: SUPPORT_INVARIANTS });
+
+    const refusal = agent.respond("Продолжай");
+
+    await expect(refusal).rejects.toBeInstanceOf(AgentResponseError);
+    await expect(refusal).rejects.toThrow(reason);
+    expect(calls).toHaveLength(count);
+    expect(taskRepository.save).not.toHaveBeenCalled();
+    expect(agent.getTask()).toEqual(taskView(lastStep.context));
+    expect(() => agent.pauseTask()).not.toThrow();
+  });
+
+  it("runs meta once with the invariants and repeats only the final task call", async () => {
+    const { agent, calls } = setup({
+      initial: lastStep,
+      replies: [{ content: "Подготовленный промпт", totalTokens: 3 }, PROMISE_STEP, REPLY.step2],
+      config: { strategy: "meta" },
+      invariants: SUPPORT_INVARIANTS,
+    });
+
+    const result = await agent.respond("Продолжай");
+
+    const [meta, first, retry] = calls;
+    expect(calls).toHaveLength(3);
+    expect(meta!.messages.slice(1)).toEqual(first!.messages.slice(1));
+    expect(systemOf(meta!)).toContain(INVARIANTS_META_INSTRUCTION);
+    expect(systemOf(meta!).endsWith(TASK_META_INSTRUCTION)).toBe(true);
+    expect(systemOf(retry!).startsWith(systemOf(first!))).toBe(true);
+    expect(result.usage.turn.totalTokens).toBe(13);
+    expect(agent.getTask()!.status.state).toBe("validation");
+  });
+});
+
 describe("task persistence across agent instances", () => {
   let directory: string;
 
@@ -691,6 +866,30 @@ describe("task persistence across agent instances", () => {
     expect(JSON.parse(readFileSync(join(directory, ".agent-history.sliding.json"), "utf8")).messages).toEqual(
       pair("вопрос в чат", "чат sliding"),
     );
+  });
+
+  it("keeps the task file unchanged after a repeated invariant violation", async () => {
+    const planned = agentFor([REPLY.plan]);
+    planned.agent.startTask(DESCRIPTION);
+    await planned.agent.respond("Продолжай");
+    planned.agent.approveTask();
+    const before = readFileSync(join(directory, ".agent-task.json"), "utf8");
+    const fake = fakeClient([
+      json({ action: "complete_step", answer: "Мы доставим заказ завтра." }),
+      json({ action: "complete_step", answer: "Заказ будет доставлен 20 сентября." }),
+    ]);
+    const agent = new Agent({
+      client: fake.client,
+      config: { ...DEFAULT_AGENT_CONFIG, contextStrategy: "sliding" },
+      ...jsonAgentRepositories(directory, "sliding"),
+      invariants: SUPPORT_INVARIANTS,
+    });
+
+    await expect(agent.respond("Продолжай")).rejects.toThrow("повторная генерация тоже нарушает инварианты");
+
+    expect(fake.calls).toHaveLength(2);
+    expect(readFileSync(join(directory, ".agent-task.json"), "utf8")).toBe(before);
+    expect(agent.getTask()!.status).toMatchObject({ state: "execution", step: { number: 1 } });
   });
 
   it("fails on a corrupted task file without overwriting it", () => {

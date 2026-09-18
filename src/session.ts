@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { type Agent, AgentBusyError, type AgentResult, type ContextStatus } from "./agent.ts";
 import type { ContextStrategy } from "./history.ts";
+import type { InvariantInfo } from "./invariants.ts";
 import { JsonHistoryRepository } from "./json-history-repository.ts";
 import { JsonMemoryRepository } from "./json-memory-repository.ts";
 import { JsonTaskRepository } from "./json-task-repository.ts";
@@ -129,6 +130,10 @@ export class AgentSession {
 
   getContextStatus(): ContextStatus {
     return this.agent.getContextStatus();
+  }
+
+  getInvariants(): InvariantInfo[] {
+    return this.agent.getInvariants();
   }
 
   getMemory(): MemorySnapshot {

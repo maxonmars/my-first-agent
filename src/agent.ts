@@ -10,6 +10,17 @@ import {
   type HistoryRepository,
   type HistoryState,
 } from "./history.ts";
+import {
+  INVARIANTS_INSTRUCTION,
+  INVARIANTS_META_INSTRUCTION,
+  type Invariant,
+  type InvariantInfo,
+  type InvariantViolation,
+  invariantInfo,
+  invariantsBlock,
+  invariantsRetryInstruction,
+  validateInvariants,
+} from "./invariants.ts";
 import type { DeepSeekParams, LlmClient, LlmCompletion } from "./llm-client.ts";
 import {
   LONG_TERM_MEMORY_TITLE,
@@ -37,6 +48,7 @@ import {
   createTask,
   parseTaskReply,
   TASK_INSTRUCTION,
+  TASK_INVARIANTS_INSTRUCTION,
   TASK_META_INSTRUCTION,
   type TaskContext,
   TaskError,
@@ -97,6 +109,8 @@ export interface AgentOptions {
   taskRepository?: TaskRepository;
   /** Синхронный источник профиля; вызывается один раз в начале каждого respond(). */
   profileProvider?: () => AgentProfile;
+  /** Статические правила ответа; без них или с пустым списком запросы и число вызовов прежние. */
+  invariants?: readonly Invariant[];
 }
 
 type PreparedParams = DeepSeekParams & {
@@ -118,7 +132,14 @@ interface TurnContext {
   summary: string | null;
   memory: WritableMemory;
   profile: AgentProfile;
+  invariants: InvariantInfo[];
   task: TaskContext | null;
+}
+
+/** Ответ, прошедший локальные проверки; text — пользовательский текст для проверки инвариантов. */
+interface Candidate<T> {
+  value: T;
+  text: string;
 }
 
 export interface ContextStatus {
@@ -146,6 +167,7 @@ export class Agent {
   private readonly memoryRepositories: Record<WritableMemoryLayer, MemoryRepository | undefined>;
   private readonly profileProvider: (() => AgentProfile) | undefined;
   private readonly taskRepository: TaskRepository | undefined;
+  private readonly invariants: readonly Invariant[];
   private history: HistoryState;
   private memory: WritableMemory;
   private task: TaskSnapshot | null;
@@ -158,6 +180,7 @@ export class Agent {
     this.config = Object.freeze({ ...options.config });
     this.historyRepository = options.historyRepository;
     this.profileProvider = options.profileProvider;
+    this.invariants = Object.freeze([...(options.invariants ?? [])]);
     this.history = structuredClone(this.historyRepository?.load() ?? emptyHistory(this.config.contextStrategy));
     if (this.history.kind !== (this.config.contextStrategy ?? "compression")) {
       throw new AgentConfigError("Стратегия сохранённой истории не совпадает с contextStrategy.");
@@ -251,9 +274,8 @@ export class Agent {
         }
         context.facts = result.data;
       }
-      const { completion, usage } = await this.answer(context, question);
+      const { completion, value: text, usage } = await this.answer(context, question, acceptText);
       turnUsage = addUsage(turnUsage, usage);
-      const text = requireAnswer(completion);
       const validation = FORMATS[this.config.format].validate(text);
 
       const messages: HistoryMessage[] = [
@@ -280,17 +302,23 @@ export class Agent {
   }
 
   private async respondTask(context: TurnContext, task: TaskContext, question: string): Promise<AgentResult> {
-    const { completion, usage } = await this.answer(context, question);
-    const candidate = taskCandidate(task, context.messages, question, completion, this.config.format);
-    this.commitTask(candidate.snapshot);
-    return this.result(question, candidate.answer, candidate.validation, completion, usage, null, null);
+    const { completion, value, usage } = await this.answer(context, question, (reply) => {
+      const candidate = taskCandidate(task, context.messages, question, reply, this.config.format);
+      return { value: candidate, text: candidate.text };
+    });
+    this.commitTask(value.snapshot);
+    return this.result(question, value.answer, value.validation, completion, usage, null, null);
   }
 
-  /** Meta, если выбрана, и финальный вызов на одном снимке контекста. */
-  private async answer(
+  /**
+   * Meta, если выбрана, и финальный вызов на одном снимке контекста. accept выполняет локальные проверки ответа;
+   * при нарушении инвариантов — ровно одна повторная генерация на том же снимке, без повторного meta.
+   */
+  private async answer<T>(
     context: TurnContext,
     question: string,
-  ): Promise<{ completion: CompletionResult; usage: TokenUsage }> {
+    accept: (completion: CompletionResult) => Candidate<T>,
+  ): Promise<{ completion: CompletionResult; value: T; usage: TokenUsage }> {
     let usage = emptyUsage();
     let extraInstruction = STRATEGIES[this.config.strategy];
 
@@ -300,8 +328,24 @@ export class Agent {
       extraInstruction = requireAnswer(preparation);
     }
 
-    const completion = await this.complete(context, question, extraInstruction, true);
-    return { completion, usage: addUsage(usage, completion.usage) };
+    let completion = await this.complete(context, question, extraInstruction, true);
+    usage = addUsage(usage, completion.usage);
+    let candidate = accept(completion);
+    let check = validateInvariants(candidate.text, this.invariants);
+
+    if (!check.ok) {
+      completion = await this.complete(context, question, extraInstruction, true, check.violations);
+      usage = addUsage(usage, completion.usage);
+      candidate = accept(completion);
+      check = validateInvariants(candidate.text, this.invariants);
+      if (!check.ok) {
+        throw new AgentResponseError(
+          `Ответ модели отклонён: повторная генерация тоже нарушает инварианты ${check.violations.map(({ id }) => id).join(", ")}. Ответ не сохранён.`,
+        );
+      }
+    }
+
+    return { completion, value: candidate.value, usage };
   }
 
   private result(
@@ -363,6 +407,10 @@ export class Agent {
     }
     this.memoryCandidate(layer);
     this.commitMemory(layer, {});
+  }
+
+  getInvariants(): InvariantInfo[] {
+    return this.invariants.map(invariantInfo);
   }
 
   getContextStatus(): ContextStatus {
@@ -505,9 +553,10 @@ export class Agent {
   private turnContext(): TurnContext {
     const memory = structuredClone(this.memory);
     const profile = structuredClone(this.profileProvider?.() ?? {});
+    const invariants = this.invariants.map(invariantInfo);
     if (this.task !== null && !this.task.context.paused) {
       const { context, messages } = structuredClone(this.task);
-      return { messages, facts: null, summary: null, memory, profile, task: context };
+      return { messages, facts: null, summary: null, memory, profile, invariants, task: context };
     }
     if (this.history.kind === "branching") {
       return {
@@ -516,6 +565,7 @@ export class Agent {
         summary: null,
         memory,
         profile,
+        invariants,
         task: null,
       };
     }
@@ -526,6 +576,7 @@ export class Agent {
         facts: null,
         memory,
         profile,
+        invariants,
         task: null,
       };
     }
@@ -535,18 +586,22 @@ export class Agent {
       facts: this.history.kind === "facts" ? { ...this.history.facts } : null,
       memory,
       profile,
+      invariants,
       task: null,
     };
   }
 
+  /** violations — нарушения отклонённого ответа: непустой список означает повторную генерацию. */
   private async complete(
     context: TurnContext,
     question: string,
     extraInstruction: string,
     applyOutputPolicy: boolean,
+    violations: readonly InvariantViolation[] = [],
   ): Promise<CompletionResult> {
-    const params = this.buildParams(context, question, extraInstruction, applyOutputPolicy);
-    return this.execute(params, applyOutputPolicy ? "финальный ответ" : "meta", context);
+    const params = this.buildParams(context, question, extraInstruction, applyOutputPolicy, violations);
+    const stage = violations.length > 0 ? "повторный ответ" : applyOutputPolicy ? "финальный ответ" : "meta";
+    return this.execute(params, stage, context);
   }
 
   /** context равен null для служебных summary и facts: их подсказка не упоминает память и профиль. */
@@ -571,6 +626,9 @@ export class Agent {
                 : [
                     "Профиль агента тоже входит в запрос, а /reset его сохраняет: при необходимости сократите его командами /profile delete или /profile clear.",
                   ]),
+              ...(context.invariants.length === 0
+                ? []
+                : ["Обязательные инварианты тоже входят в запрос и не очищаются через /reset."]),
             ];
       throw new AgentContextLimitError(
         `Этап «${stage}»: оценка входного контекста ≈ ${contextTokens} токенов превышает установленный лимит ${this.config.maxInputTokens}. ${hints.join(" ")}`,
@@ -597,14 +655,18 @@ export class Agent {
     question: string,
     extraInstruction: string,
     applyOutputPolicy: boolean,
+    violations: readonly InvariantViolation[],
   ): PreparedParams {
     const params: PreparedParams = {
       model: this.config.model,
       messages: [
-        { role: "system", content: this.buildSystemPrompt(context, extraInstruction, applyOutputPolicy) },
+        { role: "system", content: this.buildSystemPrompt(context, extraInstruction, applyOutputPolicy, violations) },
         ...(isProfileEmpty(context.profile)
           ? []
           : [{ role: "user" as const, content: `${PROFILE_TITLE}\n${JSON.stringify(context.profile)}` }]),
+        ...(context.invariants.length === 0
+          ? []
+          : [{ role: "user" as const, content: invariantsBlock(context.invariants) }]),
         ...memoryMessages(LONG_TERM_MEMORY_TITLE, context.memory.long),
         ...memoryMessages(WORKING_MEMORY_TITLE, context.memory.working),
         ...(context.task === null ? [] : [{ role: "user" as const, content: taskDataBlock(context.task) }]),
@@ -643,18 +705,27 @@ export class Agent {
     return params;
   }
 
-  private buildSystemPrompt(context: TurnContext, extraInstruction: string, applyOutputPolicy: boolean): string {
+  private buildSystemPrompt(
+    context: TurnContext,
+    extraInstruction: string,
+    applyOutputPolicy: boolean,
+    violations: readonly InvariantViolation[],
+  ): string {
     const withProfile = !isProfileEmpty(context.profile);
+    const withInvariants = context.invariants.length > 0;
     const blocks = [
       this.config.systemPrompt,
       withProfile ? PROFILE_INSTRUCTION : "",
+      withInvariants ? INVARIANTS_INSTRUCTION : "",
       hasMemory(context.memory) ? MEMORY_INSTRUCTION : "",
       extraInstruction,
       withProfile && !applyOutputPolicy ? PROFILE_META_INSTRUCTION : "",
+      withInvariants && !applyOutputPolicy ? INVARIANTS_META_INSTRUCTION : "",
     ];
 
     if (context.task !== null) {
       blocks.push(applyOutputPolicy ? TASK_INSTRUCTION : TASK_META_INSTRUCTION);
+      if (applyOutputPolicy && withInvariants) blocks.push(TASK_INVARIANTS_INSTRUCTION);
       const format = FORMATS[this.config.format].instruction;
       if (applyOutputPolicy && format.length > 0) blocks.push(`Требование к тексту в поле answer: ${format}`);
       if (applyOutputPolicy && this.config.maxWords !== null) {
@@ -669,6 +740,8 @@ export class Agent {
         blocks.push(`Закончив ответ, выведи ${this.config.stopMarker} и больше ничего не пиши.`);
       }
     }
+
+    if (violations.length > 0) blocks.push(invariantsRetryInstruction(violations));
 
     return blocks.filter((block) => block.length > 0).join("\n\n");
   }
@@ -745,14 +818,22 @@ function requireAnswer(completion: CompletionResult): string {
   return completion.text;
 }
 
-/** Проверяет финальный ответ задачи и строит кандидат снимка; любое нарушение протокола — AgentResponseError. */
+function acceptText(completion: CompletionResult): Candidate<string> {
+  const text = requireAnswer(completion);
+  return { value: text, text };
+}
+
+/**
+ * Проверяет финальный ответ задачи и строит кандидат снимка; любое нарушение протокола — AgentResponseError.
+ * text — answer и шаги плана: пользовательский текст для проверки инвариантов.
+ */
 function taskCandidate(
   task: TaskContext,
   messages: HistoryMessage[],
   question: string,
   completion: CompletionResult,
   format: FormatName,
-): { answer: string; validation: ValidationResult; snapshot: TaskSnapshot } {
+): { answer: string; text: string; validation: ValidationResult; snapshot: TaskSnapshot } {
   try {
     if (completion.finishReason !== "stop") {
       throw new TaskError(
@@ -768,7 +849,8 @@ function taskCandidate(
     };
     const problem = taskSnapshotProblem(snapshot);
     if (problem !== null) throw new TaskError(`несогласованное состояние, ${problem}`);
-    return { answer: reply.answer, validation, snapshot };
+    const text = [reply.answer, ...(reply.action === "propose_plan" ? reply.steps : [])].join("\n");
+    return { answer: reply.answer, text, validation, snapshot };
   } catch (error) {
     if (!(error instanceof TaskError)) throw error;
     throw new AgentResponseError(

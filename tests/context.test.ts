@@ -2,9 +2,18 @@ import { describe, expect, it, vi } from "vitest";
 import { Agent, AgentBusyError, type AgentConfig, AgentConfigError } from "../src/agent.ts";
 import { DEFAULT_AGENT_CONFIG } from "../src/config.ts";
 import { emptyHistory, type HistoryMessage, type HistoryRepository, type HistoryState } from "../src/history.ts";
+import {
+  INVARIANTS_INSTRUCTION,
+  INVARIANTS_META_INSTRUCTION,
+  INVARIANTS_TITLE,
+  invariantsBlock,
+  invariantsRetryInstruction,
+} from "../src/invariants.ts";
 import type { DeepSeekParams, LlmCompletion } from "../src/llm-client.ts";
+import { META_INSTRUCTION } from "../src/strategies.ts";
+import { SUPPORT_INVARIANTS } from "../src/support-invariants.ts";
 import { estimateContextTokens } from "../src/tokens.ts";
-import { completionResponse, type FakeReply, fakeClient } from "./support/fake-client.ts";
+import { completionResponse, type FakeReply, fakeClient, systemOf } from "./support/fake-client.ts";
 
 function messages(count: number): HistoryMessage[] {
   return Array.from({ length: count }, (_, i) => ({
@@ -345,6 +354,110 @@ describe("facts memory", () => {
       expect(equal.calls).toHaveLength(3);
     },
   );
+});
+
+describe("invariants across context strategies", () => {
+  const VIOLATING = "Мы доставим заказ завтра.";
+  const SAFE = "Срок доставки уточняется.";
+  const DEADLINE = [{ id: SUPPORT_INVARIANTS[0]!.id, description: SUPPORT_INVARIANTS[0]!.description }];
+
+  function invariantSetup(state: HistoryState, replies: FakeReply[], config: Partial<AgentConfig> = {}) {
+    const fake = fakeClient(replies);
+    const repository = { load: vi.fn(() => structuredClone(state)), save: vi.fn<HistoryRepository["save"]>() };
+    const agent = new Agent({
+      client: fake.client,
+      historyRepository: repository,
+      config: { ...DEFAULT_AGENT_CONFIG, contextStrategy: state.kind, historyKeepLastMessages: 2, ...config },
+      invariants: SUPPORT_INVARIANTS,
+    });
+    return { ...fake, repository, agent };
+  }
+
+  it.each<{ name: string; state: HistoryState; config?: Partial<AgentConfig>; service: FakeReply[] }>([
+    {
+      name: "no strategy",
+      state: { kind: "compression", summary: "Прежнее summary", messages: messages(4) },
+      config: { contextStrategy: null },
+      service: [],
+    },
+    {
+      name: "compression",
+      state: { kind: "compression", summary: null, messages: messages(12) },
+      service: [{ content: "Сводка", totalTokens: 2 }],
+    },
+    { name: "sliding", state: { kind: "sliding", messages: messages(6) }, service: [] },
+    {
+      name: "facts",
+      state: { kind: "facts", facts: { city: "Казань" }, messages: messages(6) },
+      service: [{ content: '{"city":"Казань"}', totalTokens: 2 }],
+    },
+    {
+      name: "branching",
+      state: {
+        kind: "branching",
+        activeBranch: "a",
+        branches: { main: messages(2), a: messages(6) },
+        checkpoint: messages(2),
+      },
+      service: [],
+    },
+  ])("$name: retries only the final call on the same candidate, service calls get no invariants", async (testCase) => {
+    const { agent, calls, repository } = invariantSetup(
+      testCase.state,
+      [...testCase.service, { content: VIOLATING, totalTokens: 7 }, { content: SAFE, totalTokens: 3 }],
+      testCase.config,
+    );
+
+    const result = await agent.respond("вопрос");
+
+    expect(calls).toHaveLength(testCase.service.length + 2);
+    for (const call of calls.slice(0, testCase.service.length)) {
+      expect(JSON.stringify(call)).not.toContain(INVARIANTS_TITLE);
+      expect(systemOf(call)).not.toContain(INVARIANTS_INSTRUCTION);
+    }
+    const [first, retry] = calls.slice(testCase.service.length);
+    expect(first!.messages[1]).toEqual({ role: "user", content: invariantsBlock(SUPPORT_INVARIANTS) });
+    expect(systemOf(first!)).toContain(INVARIANTS_INSTRUCTION);
+    expect(retry!.messages.slice(1)).toEqual(first!.messages.slice(1));
+    expect(systemOf(retry!)).toBe(`${systemOf(first!)}\n\n${invariantsRetryInstruction(DEADLINE)}`);
+    expect(result.text).toBe(SAFE);
+    expect(result.usage.turn.totalTokens).toBe(testCase.service.length * 2 + 10);
+    expect(repository.save).toHaveBeenCalledOnce();
+    const saved = JSON.stringify(repository.save.mock.calls[0]![0]);
+    expect(saved).toContain(SAFE);
+    expect(saved).not.toContain(VIOLATING);
+    expect(saved).not.toContain(INVARIANTS_TITLE);
+  });
+
+  it("meta: prepares once on the same invariants snapshot and retries only the final call", async () => {
+    const { agent, calls, repository } = invariantSetup(
+      { kind: "sliding", messages: messages(2) },
+      [
+        { content: "Подготовленный промпт", totalTokens: 2 },
+        { content: VIOLATING, totalTokens: 7 },
+        { content: SAFE, totalTokens: 3 },
+      ],
+      { strategy: "meta" },
+    );
+
+    const result = await agent.respond("вопрос");
+
+    expect(calls).toHaveLength(3);
+    const [meta, first, retry] = calls;
+    expect(meta!.messages.slice(1)).toEqual(first!.messages.slice(1));
+    expect(meta!.messages[1]).toEqual({ role: "user", content: invariantsBlock(SUPPORT_INVARIANTS) });
+    expect(systemOf(meta!)).toContain(`${INVARIANTS_INSTRUCTION}\n\n${META_INSTRUCTION}`);
+    expect(systemOf(meta!).endsWith(INVARIANTS_META_INSTRUCTION)).toBe(true);
+    expect(systemOf(first!)).toContain(INVARIANTS_INSTRUCTION);
+    expect(systemOf(first!)).toContain("Подготовленный промпт");
+    expect(systemOf(first!)).not.toContain(INVARIANTS_META_INSTRUCTION);
+    expect(systemOf(retry!)).toBe(`${systemOf(first!)}\n\n${invariantsRetryInstruction(DEADLINE)}`);
+    expect(result.usage.finalCall.totalTokens).toBe(3);
+    expect(result.usage.turn.totalTokens).toBe(12);
+    const saved = JSON.stringify(repository.save.mock.calls);
+    expect(saved).not.toContain("Подготовленный промпт");
+    expect(saved).not.toContain(VIOLATING);
+  });
 });
 
 it.each([0, -2, 3, 2.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
