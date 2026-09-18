@@ -11,6 +11,7 @@ import {
   printNotice,
   printProfile,
   printProfileIntro,
+  printProfileList,
   printProfileStep,
   printPrompt,
   printSession,
@@ -20,7 +21,13 @@ import {
   printWarning,
 } from "./cli-view.ts";
 import { MEMORY_LAYERS, type MemoryLayer, type MemorySnapshot, type WritableMemoryLayer } from "./memory.ts";
-import { normalizeUserId, PROFILE_FIELDS, type ProfileField, USER_ID_RULE, type UserProfile } from "./profile.ts";
+import {
+  type AgentProfile,
+  normalizeProfileId,
+  PROFILE_FIELDS,
+  PROFILE_ID_RULE,
+  type ProfileField,
+} from "./profile.ts";
 import type { TaskView } from "./task.ts";
 
 export interface AgentPort {
@@ -43,12 +50,13 @@ export interface AgentPort {
   clearTask(): boolean;
 }
 
-/** Агент выбранного пользователя и операции над каталогом профилей. */
+/** Агент с общей памятью и операции над каталогом его профилей. */
 export interface SessionPort extends AgentPort {
-  getActiveUserId(): string | null;
-  loadProfile(userId: string): UserProfile | null;
-  initProfile(userId: string, profile: UserProfile): void;
-  switchUser(userId: string): void;
+  getActiveProfileId(): string | null;
+  listProfileIds(): readonly string[];
+  loadProfile(profileId: string): AgentProfile | null;
+  initProfile(profileId: string, profile: AgentProfile): void;
+  switchProfile(profileId: string): void;
   setProfileField(field: ProfileField, value: string): void;
   deleteProfileField(field: ProfileField): boolean;
   clearProfile(): void;
@@ -75,29 +83,30 @@ const TASK_USAGE = {
   clear: "/task clear",
 };
 const PROFILE_USAGE = {
-  load: "/profile load userId",
+  list: "/profile list",
+  load: "/profile load profileId",
   set: "/profile set style|constraints|context значение",
   delete: "/profile delete style|constraints|context",
   clear: "/profile clear",
 };
-const USER_ID_QUESTION = "Укажите идентификатор пользователя, например Макс или Владимир.";
+const PROFILE_ID_QUESTION = "Укажите идентификатор профиля агента, например аналитик, автор или редактор.";
 const PROFILE_QUESTIONS: Record<ProfileField, { question: string; hint: string }> = {
   style: {
-    question: "Как с вами общаться и оформлять ответы?",
-    hint: "обращение, «ты» или «вы», тон, краткость или подробность, простой язык или профессиональные термины, текст, списки, таблицы, примеры",
+    question: "Как агент должен общаться и оформлять результат?",
+    hint: "тон, краткость или подробность, простой язык или термины, текст, списки, таблицы, структура результата",
   },
   constraints: {
-    question: "Какие правила соблюдать и чего избегать в ответах?",
-    hint: "эмодзи, код без просьбы, ограничения предлагаемых инструментов и решений, уточнения при нехватке информации, обозначение предположений",
+    question: "Какие правила агент должен соблюдать и чего избегать при работе?",
+    hint: "что не добавлять и не менять, как обозначать предположения, когда уточнять, границы роли",
   },
   context: {
-    question: "Что стоит знать о вас, чтобы ответы были полезнее?",
-    hint: "занятие, уровень опыта, привычные инструменты, типичные задачи и долгосрочные цели",
+    question: "Какую роль выполняет агент, в какой области и на каких задачах специализируется?",
+    hint: "роль, предметная область, типичные задачи и критерии качества результата",
   },
 };
 
-/** Черновик опроса /profile-init; userId === null — ещё не введён идентификатор. */
-type ProfileWizard = { userId: null } | { userId: string; field: ProfileField; draft: UserProfile };
+/** Черновик опроса /profile-init; profileId === null — ещё не введён идентификатор. */
+type ProfileWizard = { profileId: null } | { profileId: string; field: ProfileField; draft: AgentProfile };
 
 const HELP: readonly HelpGroup[] = [
   {
@@ -107,7 +116,7 @@ const HELP: readonly HelpGroup[] = [
       ["/help", "показать эту справку"],
       [
         "/reset",
-        "очистить историю выбранной стратегии и статистику; рабочая и долговременная память, профиль и задача сохраняются",
+        "очистить историю выбранной стратегии и статистику; рабочая и долговременная память, профили и задача сохраняются",
       ],
       ["/exit", "завершить диалог"],
       "Новый разговор: /reset, затем /memory clear working — рабочая память очищается отдельно.",
@@ -138,12 +147,14 @@ const HELP: readonly HelpGroup[] = [
   {
     title: "Профиль",
     lines: [
-      ["/profile-init", "создать или изменить профиль пошаговым опросом и выбрать пользователя"],
-      ["/profile", "показать активного пользователя и профиль"],
-      [PROFILE_USAGE.load, "выбрать существующего пользователя"],
+      "Профиль агента — роль, ограничения и стиль; история, память и задача общие для всех профилей.",
+      ["/profile-init", "создать или изменить профиль агента пошаговым опросом и выбрать его"],
+      ["/profile", "показать активный профиль"],
+      [PROFILE_USAGE.list, "показать сохранённые профили и отметить активный"],
+      [PROFILE_USAGE.load, "выбрать существующий профиль; действует со следующего ответа"],
       [PROFILE_USAGE.set, "заменить группу профиля; значение — остаток строки"],
       [PROFILE_USAGE.delete, "удалить группу профиля"],
-      [PROFILE_USAGE.clear, "очистить профиль; история и память пользователя сохраняются"],
+      [PROFILE_USAGE.clear, "очистить настройки активного профиля; общие история, память и задача сохраняются"],
     ],
   },
   {
@@ -220,8 +231,8 @@ async function handleLine(agent: SessionPort, question: string, io: CliIo): Prom
       printError(io.error, "Команда не выполнена: Лишние аргументы. Использование: /profile-init");
       return null;
     }
-    printProfileIntro(io.output, USER_ID_QUESTION);
-    return { userId: null };
+    printProfileIntro(io.output, PROFILE_ID_QUESTION);
+    return { profileId: null };
   }
 
   if (question.startsWith("/")) {
@@ -271,37 +282,37 @@ function stepWizard(
     return wizard;
   }
 
-  if (wizard.userId === null) {
-    const userId = normalizeUserId(answer);
-    if (userId === null) {
-      printError(io.error, `Неверный ${USER_ID_RULE}.`);
-      printNotice(io.error, USER_ID_QUESTION);
+  if (wizard.profileId === null) {
+    const profileId = normalizeProfileId(answer);
+    if (profileId === null) {
+      printError(io.error, `Неверный ${PROFILE_ID_RULE}.`);
+      printNotice(io.error, PROFILE_ID_QUESTION);
       return wizard;
     }
-    const existing = agent.loadProfile(userId);
-    printNotice(io.output, existing === null ? `Новый профиль «${userId}».` : `Изменение профиля «${userId}».`);
-    return askField(io.output, { userId, field: PROFILE_FIELDS[0], draft: existing ?? {} });
+    const existing = agent.loadProfile(profileId);
+    printNotice(io.output, existing === null ? `Новый профиль «${profileId}».` : `Изменение профиля «${profileId}».`);
+    return askField(io.output, { profileId, field: PROFILE_FIELDS[0], draft: existing ?? {} });
   }
 
   const draft = answer.length === 0 ? wizard.draft : { ...wizard.draft, [wizard.field]: answer };
   const nextField = PROFILE_FIELDS[PROFILE_FIELDS.indexOf(wizard.field) + 1];
-  if (nextField !== undefined) return askField(io.output, { userId: wizard.userId, field: nextField, draft });
+  if (nextField !== undefined) return askField(io.output, { profileId: wizard.profileId, field: nextField, draft });
 
   try {
-    agent.initProfile(wizard.userId, draft);
+    agent.initProfile(wizard.profileId, draft);
   } catch (error) {
     printError(io.error, `Профиль не сохранён: ${messageOf(error)}`);
     return null;
   }
-  printSuccess(io.output, `Профиль «${wizard.userId}» сохранён.`);
+  printSuccess(io.output, `Профиль «${wizard.profileId}» сохранён.`);
   writeStatus(io.output, agent);
   writeProfile(io.output, agent);
   return null;
 }
 
-function askField(output: Writable, wizard: Extract<ProfileWizard, { userId: string }>): ProfileWizard {
+function askField(output: Writable, wizard: Extract<ProfileWizard, { profileId: string }>): ProfileWizard {
   printProfileStep(output, {
-    userId: wizard.userId,
+    profileId: wizard.profileId,
     position: PROFILE_FIELDS.indexOf(wizard.field) + 1,
     total: PROFILE_FIELDS.length,
     field: wizard.field,
@@ -319,11 +330,15 @@ function runProfileCommand(agent: SessionPort, input: string, output: Writable):
     case undefined:
       writeProfile(output, agent);
       break;
+    case "list":
+      expectWordCount(words, 2, PROFILE_USAGE.list);
+      printProfileList(output, agent.listProfileIds(), agent.getActiveProfileId());
+      break;
     case "load": {
       expectWordCount(words, 3, PROFILE_USAGE.load);
-      const alreadyActive = agent.getActiveUserId() === words[2];
-      agent.switchUser(words[2]!);
-      if (alreadyActive) printNotice(output, `Пользователь «${words[2]}» уже выбран.`);
+      const alreadyActive = agent.getActiveProfileId() === words[2];
+      agent.switchProfile(words[2]!);
+      if (alreadyActive) printNotice(output, `Профиль «${words[2]}» уже выбран.`);
       writeStatus(output, agent);
       break;
     }
@@ -332,21 +347,25 @@ function runProfileCommand(agent: SessionPort, input: string, output: Writable):
       if (words.length < 4) throw new Error(`Не хватает аргументов. Использование: ${PROFILE_USAGE.set}`);
       // Значение — весь остаток строки после группы, с внутренними пробелами.
       agent.setProfileField(field, input.replace(/^(?:\S+\s+){3}/, ""));
-      printSuccess(output, `Группа ${field} сохранена в профиле «${agent.getActiveUserId()}».`);
+      printSuccess(output, `Группа ${field} сохранена в профиле «${agent.getActiveProfileId()}».`);
       break;
     }
     case "delete": {
       const field = profileField(words[2], PROFILE_USAGE.delete);
       expectWordCount(words, 3, PROFILE_USAGE.delete);
       if (agent.deleteProfileField(field)) {
-        printSuccess(output, `Группа ${field} удалена из профиля «${agent.getActiveUserId()}».`);
-      } else printNotice(output, `Группы ${field} нет в профиле «${agent.getActiveUserId()}».`);
+        printSuccess(output, `Группа ${field} удалена из профиля «${agent.getActiveProfileId()}».`);
+      } else printNotice(output, `Группы ${field} нет в профиле «${agent.getActiveProfileId()}».`);
       break;
     }
     case "clear":
       expectWordCount(words, 2, PROFILE_USAGE.clear);
       agent.clearProfile();
-      printSuccess(output, `Профиль «${agent.getActiveUserId()}» очищен.`, "История и память пользователя сохранены.");
+      printSuccess(
+        output,
+        `Профиль «${agent.getActiveProfileId()}» очищен.`,
+        "Общие история, память и задача сохранены.",
+      );
       break;
     default:
       throw new Error(
@@ -362,32 +381,32 @@ function profileField(word: string | undefined, usage: string): ProfileField {
   return field;
 }
 
-/** Пользователь, контекст и задача с черновиком плана и открытым вопросом. */
+/** Профиль, контекст и задача с черновиком плана и открытым вопросом. */
 function writeStatus(
   output: Writable,
   agent: SessionPort,
   header: { title?: boolean; commandsHint?: boolean } = {},
 ): void {
-  printSession(output, agent.getActiveUserId(), agent.getContextStatus(), header);
+  printSession(output, agent.getActiveProfileId(), agent.getContextStatus(), header);
   const task = agent.getTask();
   if (task !== null) printTaskState(output, task, { plan: true, question: true });
 }
 
 function writeProfile(output: Writable, agent: SessionPort): void {
-  const userId = agent.getActiveUserId();
-  if (userId === null) {
-    printNotice(output, "Пользователь не выбран: работа без профиля. Создайте профиль командой /profile-init.");
+  const profileId = agent.getActiveProfileId();
+  if (profileId === null) {
+    printNotice(output, "Профиль не выбран: работа без профиля. Создайте профиль командой /profile-init.");
     return;
   }
-  printProfile(output, userId, agent.loadProfile(userId));
+  printProfile(output, profileId, agent.loadProfile(profileId));
 }
 
 function writePrompt(output: Writable, agent: SessionPort, wizard: ProfileWizard | null): void {
   if (wizard === null) {
     const task = agent.getTask();
     const target = task === null ? "" : task.status.paused ? " [чат, задача на паузе]" : " [задача]";
-    printPrompt(output, `${agent.getActiveUserId() ?? "без профиля"}${target}`);
-  } else printPrompt(output, wizard.userId === null ? "профиль" : `профиль ${wizard.userId}`);
+    printPrompt(output, `${agent.getActiveProfileId() ?? "без профиля"}${target}`);
+  } else printPrompt(output, wizard.profileId === null ? "профиль" : `профиль ${wizard.profileId}`);
 }
 
 function runMemoryCommand(agent: AgentPort, input: string, output: Writable): void {

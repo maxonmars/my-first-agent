@@ -24,11 +24,11 @@ import {
   type WritableMemoryLayer,
 } from "./memory.ts";
 import {
+  type AgentProfile,
   isProfileEmpty,
   PROFILE_INSTRUCTION,
   PROFILE_META_INSTRUCTION,
   PROFILE_TITLE,
-  type UserProfile,
 } from "./profile.ts";
 import { META_INSTRUCTION, STRATEGIES, type StrategyName } from "./strategies.ts";
 import {
@@ -96,7 +96,7 @@ export interface AgentOptions {
   longTermMemoryRepository?: MemoryRepository;
   taskRepository?: TaskRepository;
   /** Синхронный источник профиля; вызывается один раз в начале каждого respond(). */
-  profileProvider?: () => UserProfile;
+  profileProvider?: () => AgentProfile;
 }
 
 type PreparedParams = DeepSeekParams & {
@@ -117,7 +117,7 @@ interface TurnContext {
   facts: Facts | null;
   summary: string | null;
   memory: WritableMemory;
-  profile: UserProfile;
+  profile: AgentProfile;
   task: TaskContext | null;
 }
 
@@ -144,7 +144,7 @@ export class Agent {
   private readonly config: Readonly<AgentConfig>;
   private readonly historyRepository: HistoryRepository | undefined;
   private readonly memoryRepositories: Record<WritableMemoryLayer, MemoryRepository | undefined>;
-  private readonly profileProvider: (() => UserProfile) | undefined;
+  private readonly profileProvider: (() => AgentProfile) | undefined;
   private readonly taskRepository: TaskRepository | undefined;
   private history: HistoryState;
   private memory: WritableMemory;
@@ -569,7 +569,7 @@ export class Agent {
               ...(isProfileEmpty(context.profile)
                 ? []
                 : [
-                    "Профиль пользователя тоже входит в запрос, а /reset его сохраняет: при необходимости сократите его командами /profile delete или /profile clear.",
+                    "Профиль агента тоже входит в запрос, а /reset его сохраняет: при необходимости сократите его командами /profile delete или /profile clear.",
                   ]),
             ];
       throw new AgentContextLimitError(

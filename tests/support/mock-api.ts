@@ -1,4 +1,5 @@
 import { deepStrictEqual } from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, WORKING_MEMORY_TITLE } from "../../src/memory.ts";
 import { PROFILE_INSTRUCTION, PROFILE_TITLE } from "../../src/profile.ts";
 import { TASK_INSTRUCTION, TASK_TITLE } from "../../src/task.ts";
@@ -9,15 +10,47 @@ const memoryBlocks = [
 ];
 
 const profileBlocks = {
-  maks: {
+  analyst: {
     role: "user",
-    content: `${PROFILE_TITLE}\n{"style":"На ты, списком","constraints":"Без эмодзи","context":"Backend-разработчик"}`,
+    content: `${PROFILE_TITLE}\n{"style":"Короткий бриф списком","constraints":"Не придумывай факты","context":"Ты аналитик мероприятий"}`,
   },
-  vladimir: {
+  author: {
     role: "user",
-    content: `${PROFILE_TITLE}\n{"style":"На вы, таблицей","context":"Начинающий разработчик"}`,
+    content: `${PROFILE_TITLE}\n{"style":"Живой текст анонса","context":"Ты автор анонсов"}`,
   },
 };
+const sharedContext = [
+  { role: "user", content: `${WORKING_MEMORY_TITLE}\n{"event":"Онлайн-встреча, 40 минут"}` },
+  { role: "user", content: "проверка связи" },
+  { role: "assistant", content: "Эхо: проверка связи" },
+  { role: "user", content: "Составь бриф" },
+  { role: "assistant", content: "Эхо: Составь бриф" },
+];
+
+// Шаги docs/profile-video-prompts.md: вопрос и профиль, активный на этом шаге.
+// «автор» создаётся во время сценария через /profile-init и в демо-файле не хранится.
+const demoProfiles = {
+  ...JSON.parse(readFileSync(new URL("../../docs/agent-profiles.demo.json", import.meta.url), "utf8")).profiles,
+  автор: {
+    style: "Живой дружелюбный текст анонса до 120 слов: заголовок, основной текст, призыв к действию",
+    constraints:
+      "Следуй согласованному брифу. Не добавляй дату, ссылку, спикеров и другие неподтверждённые факты; вместо них оставь пометку [уточнить]",
+    context: "Ты автор анонсов мероприятий. Пишешь текст для публикации по согласованному брифу",
+  },
+};
+const demoEvent = "Бесплатная онлайн-встреча «Первый агент», 40 минут, для новичков.";
+const demoTurns = [
+  { question: "Составь краткий бриф и предложи структуру анонса.", profileId: "аналитик" },
+  { question: "Подготовь анонс по согласованному брифу.", profileId: "автор" },
+  {
+    question: "Проверь подготовленный анонс. Назови конкретные недочёты; если их нет — так и скажи.",
+    profileId: "редактор",
+  },
+  {
+    question: "Назови формат, длительность и аудиторию мероприятия, затем напомни результат последней проверки.",
+    profileId: "редактор",
+  },
+];
 
 globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = input instanceof Request ? input.url : String(input);
@@ -123,24 +156,33 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
     content = question.endsWith("branching") ? "Branching получил общую память." : "Память сохранилась без диалога.";
   }
 
-  if (question === "Проверь профиль Владимира") {
-    if (!request.messages[0]?.content.endsWith(PROFILE_INSTRUCTION)) throw new Error("Нет инструкции профиля");
-    deepStrictEqual(request.messages.slice(1, -1), [
-      profileBlocks.vladimir,
-      { role: "user", content: "Код Владимира — ДУБ" },
-      { role: "assistant", content: "Эхо: Код Владимира — ДУБ" },
-    ]);
-    content = "Профиль Владимира получен.";
-  }
-  if (question === "Проверь профиль Макса") {
+  if (question === "Проверь роль автора") {
     if (!request.messages[0]?.content.includes(PROFILE_INSTRUCTION)) throw new Error("Нет инструкции профиля");
-    deepStrictEqual(request.messages.slice(1, 5), [
-      profileBlocks.maks,
-      { role: "user", content: `${LONG_TERM_MEMORY_TITLE}\n{"language":"TypeScript"}` },
-      { role: "user", content: "Код Макса — КЕДР" },
-      { role: "assistant", content: "Эхо: Код Макса — КЕДР" },
+    deepStrictEqual(request.messages.slice(1, -1), [profileBlocks.author, ...sharedContext]);
+    content = "Автор получил общий контекст.";
+  }
+  if (question === "Проверь роль аналитика") {
+    if (!request.messages[0]?.content.includes(PROFILE_INSTRUCTION)) throw new Error("Нет инструкции профиля");
+    deepStrictEqual(request.messages.slice(1, -1), [
+      profileBlocks.analyst,
+      ...sharedContext,
+      { role: "user", content: "Проверь роль автора" },
+      { role: "assistant", content: "Автор получил общий контекст." },
     ]);
-    content = "Профиль Макса получен.";
+    content = "Аналитик получил общий контекст.";
+  }
+
+  const demoIndex = demoTurns.findIndex((turn) => turn.question === question);
+  if (demoIndex >= 0) {
+    if (!request.messages[0]?.content.includes(PROFILE_INSTRUCTION)) throw new Error("Нет инструкции профиля");
+    deepStrictEqual(request.messages.slice(1, -1), [
+      { role: "user", content: `${PROFILE_TITLE}\n${JSON.stringify(demoProfiles[demoTurns[demoIndex]!.profileId])}` },
+      { role: "user", content: `${WORKING_MEMORY_TITLE}\n${JSON.stringify({ event: demoEvent })}` },
+      ...demoTurns.slice(0, demoIndex).flatMap((turn) => [
+        { role: "user", content: turn.question },
+        { role: "assistant", content: `Эхо: ${turn.question}` },
+      ]),
+    ]);
   }
 
   if (request.messages[0]?.content.includes(TASK_INSTRUCTION)) {

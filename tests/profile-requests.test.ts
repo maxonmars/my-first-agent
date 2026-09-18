@@ -10,17 +10,21 @@ import {
   type MemoryRepository,
   WORKING_MEMORY_TITLE,
 } from "../src/memory.ts";
-import { PROFILE_INSTRUCTION, PROFILE_META_INSTRUCTION, PROFILE_TITLE, type UserProfile } from "../src/profile.ts";
+import { type AgentProfile, PROFILE_INSTRUCTION, PROFILE_META_INSTRUCTION, PROFILE_TITLE } from "../src/profile.ts";
 import { estimateContextTokens } from "../src/tokens.ts";
 import { type FakeReply, fakeClient, systemOf } from "./support/fake-client.ts";
 
-const profile: UserProfile = { style: "На ты, списком", constraints: "Без эмодзи", context: "Backend-разработчик" };
+const profile: AgentProfile = {
+  style: "Короткий список замечаний",
+  constraints: "Не добавляй неподтверждённые факты",
+  context: "Редактор анонсов мероприятий",
+};
 
 interface SetupOptions {
   state?: HistoryState;
   replies?: Array<FakeReply | Error>;
   config?: Partial<AgentConfig>;
-  provider?: () => UserProfile;
+  provider?: () => AgentProfile;
   working?: MemoryEntries;
   long?: MemoryEntries;
 }
@@ -53,7 +57,7 @@ function pairs(count: number): HistoryMessage[] {
   ]).flat();
 }
 
-function profileBlock(value: UserProfile = profile) {
+function profileBlock(value: AgentProfile = profile) {
   return { role: "user", content: `${PROFILE_TITLE}\n${JSON.stringify(value)}` };
 }
 
@@ -106,7 +110,7 @@ describe("profile in requests", () => {
       ...baselineFinal.messages.slice(1),
     ]);
     expect(withProfile.calls.slice(0, -1)).toEqual(baseline.calls.slice(0, -1));
-    expect(JSON.stringify(withProfile.calls.slice(0, -1))).not.toContain("Backend");
+    expect(JSON.stringify(withProfile.calls.slice(0, -1))).not.toContain("Редактор анонсов");
     expect(withProfile.historyRepository.save.mock.calls).toEqual(baseline.historyRepository.save.mock.calls);
     expect(results[2]!.tokenEstimate.contextTokens).toBe(estimate(withProfile.calls.at(-1)!));
   });
@@ -147,8 +151,13 @@ describe("profile in requests", () => {
     expect(system.indexOf(PROFILE_INSTRUCTION)).toBeGreaterThan(0);
     expect(system.indexOf("Уложись в 50 слов.")).toBeGreaterThan(system.indexOf(PROFILE_INSTRUCTION));
     expect(system).toContain("Оформи ответ в Markdown");
-    expect(PROFILE_INSTRUCTION).toContain("уточняет общую рекомендацию отвечать кратко");
-    expect(PROFILE_INSTRUCTION).toContain("текущий запрос, затем рабочая память, затем профиль");
+    expect(PROFILE_INSTRUCTION).toContain("context задаёт твою роль");
+    expect(PROFILE_INSTRUCTION).toContain("не меняют выбранную роль и ограничения");
+    expect(PROFILE_INSTRUCTION).toContain("предложи сменить профиль командой /profile load");
+    expect(PROFILE_INSTRUCTION).toContain("Ответы других ролей в истории — материал общей работы");
+    expect(PROFILE_INSTRUCTION).toContain("Смена профиля не утверждает план и не меняет этап задачи");
+    expect(PROFILE_INSTRUCTION).not.toContain("приоритет такой: текущий запрос");
+    expect(MEMORY_INSTRUCTION).toContain("в пределах системных правил и ограничений активного профиля агента");
   });
 
   it.each<{ name: string; state: HistoryState; replies: FakeReply[] }>([
@@ -164,7 +173,7 @@ describe("profile in requests", () => {
     },
   ])("$name: reads the profile once and gives meta and final the same snapshot", async ({ state, replies }) => {
     let version = 0;
-    const current: UserProfile = { ...profile };
+    const current: AgentProfile = { ...profile };
     const provider = vi.fn(() => {
       version += 1;
       return version === 1 ? current : { style: "изменённый профиль" };
@@ -186,7 +195,7 @@ describe("profile in requests", () => {
     expect(provider).toHaveBeenCalledOnce();
     const [service, meta, final] = calls;
     expect(JSON.stringify(service)).not.toContain(PROFILE_TITLE);
-    expect(JSON.stringify(service)).not.toContain("Backend");
+    expect(JSON.stringify(service)).not.toContain("Редактор анонсов");
     expect(meta!.messages[1]).toEqual(profileBlock());
     expect(final!.messages.slice(1)).toEqual(meta!.messages.slice(1));
     expect(systemOf(meta!)).toContain(PROFILE_INSTRUCTION);
@@ -205,9 +214,13 @@ describe("profile in requests", () => {
 
     await agent.respond("вопрос");
 
-    expect(JSON.stringify(historyRepository.save.mock.calls)).not.toContain("Backend");
-    expect(JSON.stringify(agent.getMemory())).not.toContain("Backend");
-    expect(profile).toEqual({ style: "На ты, списком", constraints: "Без эмодзи", context: "Backend-разработчик" });
+    expect(JSON.stringify(historyRepository.save.mock.calls)).not.toContain("Редактор анонсов");
+    expect(JSON.stringify(agent.getMemory())).not.toContain("Редактор анонсов");
+    expect(profile).toEqual({
+      style: "Короткий список замечаний",
+      constraints: "Не добавляй неподтверждённые факты",
+      context: "Редактор анонсов мероприятий",
+    });
   });
 
   it.each(["direct", "meta"] as const)(
@@ -215,7 +228,7 @@ describe("profile in requests", () => {
     async (strategy) => {
       const replies: FakeReply[] = [...(strategy === "meta" ? [{ content: "Подготовка", totalTokens: 7 }] : []), {}];
       const config: Partial<AgentConfig> = { strategy };
-      const large: UserProfile = { context: "опыт ".repeat(1000) };
+      const large: AgentProfile = { context: "роль ".repeat(1000) };
 
       const baseline = setup({ replies, config });
       await baseline.agent.respond("вопрос");

@@ -18,12 +18,12 @@ try {
   const root = process.cwd();
   const session = new AgentSession({
     profilesRepository: new JsonProfilesRepository(resolve(root, ".agent-profiles.json")),
-    createAgent: (userId, profileProvider) =>
+    createAgent: (profileProvider) =>
       new Agent({
         client: client.chat.completions,
         config: config.agent,
-        ...jsonAgentRepositories(root, userId, config.agent.contextStrategy),
-        ...(profileProvider === undefined ? {} : { profileProvider }),
+        ...jsonAgentRepositories(root, config.agent.contextStrategy),
+        profileProvider,
       }),
   });
 
