@@ -93,7 +93,7 @@ function expectClosedStyles(text: string): void {
   }
 }
 
-const HEADER = "── my-first-agent ──\n\nПользователь: без профиля\nКонтекст: sliding\n";
+const HEADER = "── my-first-agent ──\n\nПрофиль: без профиля\nКонтекст: sliding\n";
 const COMMANDS_HINT = "Команды: /help · /task · /memory · /profile\n";
 const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.";
 const PAUSE_HINT = "Далее → /task resume, чтобы вернуться к задаче; сейчас реплики идут в обычный чат";
@@ -115,10 +115,11 @@ function fakeAgent(replies: Array<AgentResult | Error>): SessionPort & {
   setMemory: ReturnType<typeof vi.fn<SessionPort["setMemory"]>>;
   deleteMemory: ReturnType<typeof vi.fn<SessionPort["deleteMemory"]>>;
   clearMemory: ReturnType<typeof vi.fn<SessionPort["clearMemory"]>>;
-  getActiveUserId: ReturnType<typeof vi.fn<SessionPort["getActiveUserId"]>>;
+  getActiveProfileId: ReturnType<typeof vi.fn<SessionPort["getActiveProfileId"]>>;
+  listProfileIds: ReturnType<typeof vi.fn<SessionPort["listProfileIds"]>>;
   loadProfile: ReturnType<typeof vi.fn<SessionPort["loadProfile"]>>;
   initProfile: ReturnType<typeof vi.fn<SessionPort["initProfile"]>>;
-  switchUser: ReturnType<typeof vi.fn<SessionPort["switchUser"]>>;
+  switchProfile: ReturnType<typeof vi.fn<SessionPort["switchProfile"]>>;
   setProfileField: ReturnType<typeof vi.fn<SessionPort["setProfileField"]>>;
   deleteProfileField: ReturnType<typeof vi.fn<SessionPort["deleteProfileField"]>>;
   clearProfile: ReturnType<typeof vi.fn<SessionPort["clearProfile"]>>;
@@ -157,10 +158,11 @@ function fakeAgent(replies: Array<AgentResult | Error>): SessionPort & {
     setMemory: vi.fn<SessionPort["setMemory"]>(),
     deleteMemory: vi.fn<SessionPort["deleteMemory"]>(() => true),
     clearMemory: vi.fn<SessionPort["clearMemory"]>(),
-    getActiveUserId: vi.fn<SessionPort["getActiveUserId"]>(() => null),
+    getActiveProfileId: vi.fn<SessionPort["getActiveProfileId"]>(() => null),
+    listProfileIds: vi.fn<SessionPort["listProfileIds"]>(() => []),
     loadProfile: vi.fn<SessionPort["loadProfile"]>(() => null),
     initProfile: vi.fn<SessionPort["initProfile"]>(),
-    switchUser: vi.fn<SessionPort["switchUser"]>(),
+    switchProfile: vi.fn<SessionPort["switchProfile"]>(),
     setProfileField: vi.fn<SessionPort["setProfileField"]>(),
     deleteProfileField: vi.fn<SessionPort["deleteProfileField"]>(() => true),
     clearProfile: vi.fn<SessionPort["clearProfile"]>(),
@@ -186,7 +188,7 @@ function mutatingMethods(agent: ReturnType<typeof fakeAgent>) {
     agent.deleteMemory,
     agent.clearMemory,
     agent.initProfile,
-    agent.switchUser,
+    agent.switchProfile,
     agent.setProfileField,
     agent.deleteProfileField,
     agent.clearProfile,
@@ -369,7 +371,8 @@ describe("help", () => {
       [
         "/profile-init",
         "/profile",
-        "/profile load userId",
+        "/profile list",
+        "/profile load profileId",
         "/profile set style|constraints|context значение",
         "/profile delete style|constraints|context",
         "/profile clear",
@@ -396,12 +399,19 @@ describe("help", () => {
       for (const command of commands) expect(group).toContain(`\n  ${command} — `);
     });
     expect(help).toContain(
-      "/reset — очистить историю выбранной стратегии и статистику; рабочая и долговременная память, профиль и задача сохраняются",
+      "/reset — очистить историю выбранной стратегии и статистику; рабочая и долговременная память, профили и задача сохраняются",
     );
     expect(help).toContain("Новый разговор: /reset, затем /memory clear working — рабочая память очищается отдельно.");
     expect(help).toContain("Задачу удаляет только /task clear.");
+    expect(help).toContain("история, память и задача общие для всех профилей");
     expect(help.slice(starts[4])).toContain("Только в режиме branching");
-    for (const method of [...mutatingMethods(agent), agent.getMemory, agent.loadProfile, agent.listBranches]) {
+    for (const method of [
+      ...mutatingMethods(agent),
+      agent.getMemory,
+      agent.loadProfile,
+      agent.listProfileIds,
+      agent.listBranches,
+    ]) {
       expect(method).not.toHaveBeenCalled();
     }
     expect(streams.error()).toBe("");
@@ -682,14 +692,14 @@ describe("memory commands", () => {
 });
 
 describe("profile wizard", () => {
-  function withActiveUser(agent: ReturnType<typeof fakeAgent>, initial: string | null = null) {
+  function withActiveProfile(agent: ReturnType<typeof fakeAgent>, initial: string | null = null) {
     let active = initial;
-    agent.getActiveUserId.mockImplementation(() => active);
-    agent.initProfile.mockImplementation((userId) => {
-      active = userId;
+    agent.getActiveProfileId.mockImplementation(() => active);
+    agent.initProfile.mockImplementation((profileId) => {
+      active = profileId;
     });
-    agent.switchUser.mockImplementation((userId) => {
-      active = userId;
+    agent.switchProfile.mockImplementation((profileId) => {
+      active = profileId;
     });
     return agent;
   }
@@ -700,7 +710,7 @@ describe("profile wizard", () => {
       agent.reset,
       agent.getMemory,
       agent.setMemory,
-      agent.switchUser,
+      agent.switchProfile,
       agent.setProfileField,
       agent.deleteProfileField,
       agent.clearProfile,
@@ -709,20 +719,20 @@ describe("profile wizard", () => {
     }
   }
 
-  it("asks the identifier and three groups, then saves and activates the user without the model", async () => {
-    const agent = withActiveUser(fakeAgent([]));
+  it("asks the identifier and three groups, then saves and activates the profile without the model", async () => {
+    const agent = withActiveProfile(fakeAgent([]));
     agent.loadProfile.mockReturnValueOnce(null);
     agent.loadProfile.mockReturnValueOnce({ style: "На ты, списком", context: "Backend-разработчик" });
-    const streams = capture("/profile-init\n  Макс  \n На ты, списком \nБез эмодзи\nBackend-разработчик\n/exit\n");
+    const streams = capture("/profile-init\n  редактор  \n На ты, списком \nБез эмодзи\nBackend-разработчик\n/exit\n");
 
     expect(await runCli(agent, [], streams.io)).toBe(0);
 
     // Второе чтение — показ итогового профиля после сохранения.
-    expect(agent.loadProfile.mock.calls).toEqual([["Макс"], ["Макс"]]);
+    expect(agent.loadProfile.mock.calls).toEqual([["редактор"], ["редактор"]]);
     expect(agent.loadProfile.mock.invocationCallOrder[1]).toBeGreaterThan(
       agent.initProfile.mock.invocationCallOrder[0]!,
     );
-    expect(agent.initProfile).toHaveBeenCalledExactlyOnceWith("Макс", {
+    expect(agent.initProfile).toHaveBeenCalledExactlyOnceWith("редактор", {
       style: "На ты, списком",
       constraints: "Без эмодзи",
       context: "Backend-разработчик",
@@ -731,64 +741,62 @@ describe("profile wizard", () => {
     expect(output.startsWith(`${HEADER}${COMMANDS_HINT}`)).toBe(true);
     expect(output).toContain(
       "без профиля > \n── Настройка профиля ──\n\n/cancel — отменить, /exit — выйти без сохранения.\n" +
-        "Укажите идентификатор пользователя, например Макс или Владимир.\n\nпрофиль > Новый профиль «Макс».\n",
+        "Укажите идентификатор профиля агента, например аналитик, автор или редактор.\n\nпрофиль > Новый профиль «редактор».\n",
     );
     expect(output).toContain(
-      "\n── Профиль «Макс» · 1/3 ──\n\nstyle: Как с вами общаться и оформлять ответы?\nПодсказка: обращение, «ты» или «вы», тон",
+      "\n── Профиль «редактор» · 1/3 ──\n\nstyle: Как агент должен общаться и оформлять результат?\nПодсказка: тон, краткость или подробность",
     );
     expect(output).toContain(
-      "\n── Профиль «Макс» · 2/3 ──\n\nconstraints: Какие правила соблюдать и чего избегать в ответах?",
+      "\n── Профиль «редактор» · 2/3 ──\n\nconstraints: Какие правила агент должен соблюдать и чего избегать при работе?",
     );
-    expect(output).toContain("Подсказка: эмодзи, код без просьбы");
+    expect(output).toContain("Подсказка: что не добавлять и не менять");
     expect(output).toContain(
-      "\n── Профиль «Макс» · 3/3 ──\n\ncontext: Что стоит знать о вас, чтобы ответы были полезнее?",
+      "\n── Профиль «редактор» · 3/3 ──\n\ncontext: Какую роль выполняет агент, в какой области и на каких задачах специализируется?",
     );
-    expect(output).toContain("Подсказка: занятие, уровень опыта");
-    expect(output.match(/\nпрофиль Макс > /g)).toHaveLength(3);
+    expect(output).toContain("Подсказка: роль, предметная область");
+    expect(output.match(/\nпрофиль редактор > /g)).toHaveLength(3);
     expect(output).toContain(
-      "профиль Макс > Профиль «Макс» сохранён.\nПользователь: Макс\nКонтекст: sliding\n" +
-        "\n── Профиль «Макс» ──\n\nstyle: На ты, списком\ncontext: Backend-разработчик\n\nМакс > ",
+      "профиль редактор > Профиль «редактор» сохранён.\nПрофиль: редактор\nКонтекст: sliding\n" +
+        "\n── Профиль «редактор» ──\n\nstyle: На ты, списком\ncontext: Backend-разработчик\n\nредактор > ",
     );
-    expect(output.endsWith("\nМакс > ")).toBe(true);
+    expect(output.endsWith("\nредактор > ")).toBe(true);
     expect(streams.error()).toBe("");
     expectNoOtherCalls(agent);
   });
 
   it("skips empty answers for a new profile and keeps previous values when editing an existing one", async () => {
-    const agent = withActiveUser(fakeAgent([]), "Макс");
-    agent.loadProfile.mockImplementation((userId) =>
-      userId === "Владимир" ? { style: "На вы", context: "Начинающий" } : null,
+    const agent = withActiveProfile(fakeAgent([]), "редактор");
+    agent.loadProfile.mockImplementation((profileId) =>
+      profileId === "автор" ? { style: "На вы", context: "Начинающий" } : null,
     );
-    const streams = capture(
-      "/profile-init\nНовый\n\n\nКонтекст\n/profile-init\nВладимир\n\nПояснять термины\n\n/exit\n",
-    );
+    const streams = capture("/profile-init\nНовый\n\n\nКонтекст\n/profile-init\nавтор\n\nПояснять термины\n\n/exit\n");
 
     await runCli(agent, [], streams.io);
 
     expect(agent.initProfile.mock.calls).toEqual([
       ["Новый", { context: "Контекст" }],
-      ["Владимир", { style: "На вы", context: "Начинающий", constraints: "Пояснять термины" }],
+      ["автор", { style: "На вы", context: "Начинающий", constraints: "Пояснять термины" }],
     ]);
-    const [created, edited] = streams.output().split("Изменение профиля «Владимир».");
+    const [created, edited] = streams.output().split("Изменение профиля «автор».");
     expect(created!.match(/Пустой ответ — пропустить группу\./g)).toHaveLength(3);
     expect(created).toContain("── Профиль «Новый» ──\n\nПрофиль пуст.\n");
     expect(edited).toContain("Сейчас: На вы\nПустой ответ — оставить прежнее значение.");
     expect(edited).toContain("Сейчас: Начинающий\nПустой ответ — оставить прежнее значение.");
     expect(edited).toContain("Пустой ответ — пропустить группу.");
-    expect(streams.output().endsWith("Владимир > ")).toBe(true);
+    expect(streams.output().endsWith("автор > ")).toBe(true);
   });
 
   it("repeats the identifier question after an invalid answer without loading or saving", async () => {
-    const agent = withActiveUser(fakeAgent([]));
-    const streams = capture("/profile-init\nМакс Иванов\n\n_maks\nМакс\n\n\n\n/exit\n");
+    const agent = withActiveProfile(fakeAgent([]));
+    const streams = capture("/profile-init\nстарший редактор\n\n_editor\nредактор\n\n\n\n/exit\n");
 
     await runCli(agent, [], streams.io);
 
-    expect(streams.error().match(/Ошибка · Неверный идентификатор пользователя: 1–64 символа/g)).toHaveLength(3);
-    expect(streams.error().match(/\nУкажите идентификатор пользователя/g)).toHaveLength(3);
-    expect(agent.loadProfile.mock.calls[0]).toEqual(["Макс"]);
-    expect(agent.loadProfile.mock.calls.flat()).not.toContain("Макс Иванов");
-    expect(agent.initProfile).toHaveBeenCalledExactlyOnceWith("Макс", {});
+    expect(streams.error().match(/Ошибка · Неверный идентификатор профиля: 1–64 символа/g)).toHaveLength(3);
+    expect(streams.error().match(/\nУкажите идентификатор профиля/g)).toHaveLength(3);
+    expect(agent.loadProfile.mock.calls[0]).toEqual(["редактор"]);
+    expect(agent.loadProfile.mock.calls.flat()).not.toContain("старший редактор");
+    expect(agent.initProfile).toHaveBeenCalledExactlyOnceWith("редактор", {});
   });
 
   it.each([
@@ -797,9 +805,9 @@ describe("profile wizard", () => {
     ["end of input", "стиль\nправила\n", []],
     ["/cancel at the identifier", "", []],
   ])("discards the draft on %s", async (name, rest, questions) => {
-    const agent = withActiveUser(fakeAgent([result("ответ")]), "Владимир");
+    const agent = withActiveProfile(fakeAgent([result("ответ")]), "автор");
     const input =
-      name === "/cancel at the identifier" ? "/profile-init\n/cancel\n/exit\n" : `/profile-init\nМакс\n${rest}`;
+      name === "/cancel at the identifier" ? "/profile-init\n/cancel\n/exit\n" : `/profile-init\nредактор\n${rest}`;
     const streams = capture(input);
 
     expect(await runCli(agent, [], streams.io)).toBe(0);
@@ -808,52 +816,52 @@ describe("profile wizard", () => {
     expect(agent.respond.mock.calls).toEqual(questions.map((question) => [question]));
     expect(streams.output()).not.toContain("сохранён");
     if (name.startsWith("/cancel")) {
-      expect(streams.output()).toContain("Настройка профиля отменена, изменения не сохранены.\n\nВладимир > ");
+      expect(streams.output()).toContain("Настройка профиля отменена, изменения не сохранены.\n\nавтор > ");
     }
   });
 
   it("does not run other slash commands, including /help, during the wizard or store them as values", async () => {
-    const agent = withActiveUser(fakeAgent([]));
+    const agent = withActiveProfile(fakeAgent([]));
     const streams = capture(
-      "/profile-init\n/memory\nМакс\n/reset\n/help\n/profile load Владимир\n/profile-init\nстиль\n/checkpoint\n\n\n/exit\n",
+      "/profile-init\n/memory\nредактор\n/reset\n/help\n/profile load автор\n/profile-init\nстиль\n/checkpoint\n\n\n/exit\n",
     );
 
     await runCli(agent, [], streams.io);
 
     expect(streams.output().match(/Во время настройки профиля команды не выполняются/g)).toHaveLength(6);
     expect(streams.output()).not.toContain("Справка");
-    expect(agent.initProfile).toHaveBeenCalledExactlyOnceWith("Макс", { style: "стиль" });
+    expect(agent.initProfile).toHaveBeenCalledExactlyOnceWith("редактор", { style: "стиль" });
     expect(agent.createCheckpoint).not.toHaveBeenCalled();
     expectNoOtherCalls(agent);
   });
 
-  it("reports a failed save, ends the wizard and keeps the previous user", async () => {
-    const agent = withActiveUser(fakeAgent([result("ответ")]), "Владимир");
+  it("reports a failed save, ends the wizard and keeps the previous profile", async () => {
+    const agent = withActiveProfile(fakeAgent([result("ответ")]), "автор");
     agent.initProfile.mockImplementationOnce(() => {
       throw new Error("Не удалось загрузить историю: некорректный JSON.");
     });
-    const streams = capture("/profile-init\nМакс\nстиль\n\n\nвопрос\n/exit\n");
+    const streams = capture("/profile-init\nредактор\nстиль\n\n\nвопрос\n/exit\n");
 
     await runCli(agent, [], streams.io);
 
     expect(streams.error()).toBe("Ошибка · Профиль не сохранён: Не удалось загрузить историю: некорректный JSON.\n");
     expect(streams.output()).not.toContain("сохранён");
-    expect(streams.output()).not.toContain("Пользователь: Макс");
-    expect(streams.output().replaceAll("профиль Макс > ", "")).not.toContain("Макс > ");
+    expect(streams.output()).not.toContain("Профиль: редактор");
+    expect(streams.output().replaceAll("профиль редактор > ", "")).not.toContain("редактор > ");
     expect(agent.respond).toHaveBeenCalledExactlyOnceWith("вопрос");
-    expect(streams.output().endsWith("Владимир > ")).toBe(true);
+    expect(streams.output().endsWith("автор > ")).toBe(true);
   });
 
   it("rejects arguments of /profile-init and the command in one-shot mode", async () => {
-    const agent = withActiveUser(fakeAgent([]), "Макс");
-    const streams = capture("/PROFILE-INIT Макс\n/exit\n");
+    const agent = withActiveProfile(fakeAgent([]), "редактор");
+    const streams = capture("/PROFILE-INIT редактор\n/exit\n");
     await runCli(agent, [], streams.io);
     expect(streams.error()).toBe("Ошибка · Команда не выполнена: Лишние аргументы. Использование: /profile-init\n");
     expect(agent.loadProfile).not.toHaveBeenCalled();
 
     const oneShot = capture();
     expect(await runCli(agent, ["/profile-init"], oneShot.io)).toBe(1);
-    expect(oneShot.output()).toBe("── my-first-agent ──\n\nПользователь: Макс\nКонтекст: sliding\n");
+    expect(oneShot.output()).toBe("── my-first-agent ──\n\nПрофиль: редактор\nКонтекст: sliding\n");
     expect(agent.initProfile).not.toHaveBeenCalled();
     expectNoOtherCalls(agent);
   });
@@ -863,63 +871,107 @@ describe("profile commands", () => {
   function activeAgent(active: string | null) {
     const agent = fakeAgent([result("ответ")]);
     let current = active;
-    agent.getActiveUserId.mockImplementation(() => current);
-    agent.switchUser.mockImplementation((userId) => {
-      current = userId;
+    agent.getActiveProfileId.mockImplementation(() => current);
+    agent.switchProfile.mockImplementation((profileId) => {
+      current = profileId;
     });
     return agent;
   }
 
-  it("shows the active user in the one-shot header and in the interactive prompt", async () => {
+  it("shows the active profile in the one-shot header and in the interactive prompt", async () => {
     const oneShot = capture();
-    await runCli(activeAgent("Макс"), ["вопрос"], oneShot.io);
+    await runCli(activeAgent("редактор"), ["вопрос"], oneShot.io);
     expect(oneShot.output()).toBe(
-      `── my-first-agent ──\n\nПользователь: Макс\nКонтекст: sliding\n\n── Ответ агента ──\n\nответ\n${tokensBlock()}`,
+      `── my-first-agent ──\n\nПрофиль: редактор\nКонтекст: sliding\n\n── Ответ агента ──\n\nответ\n${tokensBlock()}`,
     );
 
     const interactive = capture("Объясни кеширование.\n/exit\n");
-    await runCli(activeAgent("Макс"), [], interactive.io);
-    expect(interactive.output()).toContain(`${COMMANDS_HINT}\nМакс > \n── Ответ агента ──\n\nответ\n`);
-    expect(interactive.output().endsWith(`${tokensBlock()}\nМакс > `)).toBe(true);
+    await runCli(activeAgent("редактор"), [], interactive.io);
+    expect(interactive.output()).toContain(`${COMMANDS_HINT}\nредактор > \n── Ответ агента ──\n\nответ\n`);
+    expect(interactive.output().endsWith(`${tokensBlock()}\nредактор > `)).toBe(true);
   });
 
-  it("shows the profile as key-value pairs or suggests /profile-init without a selected user", async () => {
-    const agent = activeAgent("Макс");
+  it("shows the profile as key-value pairs or suggests /profile-init without a selected profile", async () => {
+    const agent = activeAgent("редактор");
     agent.loadProfile.mockReturnValue({ style: "На ты\nсписком", context: "Backend" });
     const streams = capture("/PROFILE\n/exit\n");
     await runCli(agent, [], streams.io);
-    expect(streams.output()).toContain("\n── Профиль «Макс» ──\n\nstyle: На ты\nсписком\ncontext: Backend\n\nМакс > ");
-    expect(agent.loadProfile).toHaveBeenCalledWith("Макс");
+    expect(streams.output()).toContain(
+      "\n── Профиль «редактор» ──\n\nstyle: На ты\nсписком\ncontext: Backend\n\nредактор > ",
+    );
+    expect(agent.loadProfile).toHaveBeenCalledWith("редактор");
 
     const none = capture("/profile\n/exit\n");
     await runCli(activeAgent(null), [], none.io);
     expect(none.output()).toContain(
-      "Пользователь не выбран: работа без профиля. Создайте профиль командой /profile-init.\n\nбез профиля > ",
+      "Профиль не выбран: работа без профиля. Создайте профиль командой /profile-init.\n\nбез профиля > ",
     );
   });
 
-  it("switches users, updates the status and prompt only after success", async () => {
-    const agent = activeAgent("Макс");
-    agent.switchUser.mockImplementationOnce(() => {
-      throw new Error("Профиль «Никто» не найден. Создайте его командой /profile-init.");
-    });
-    const streams = capture("/profile load Никто\n/Profile LOAD Владимир\n/profile load Владимир\n/exit\n");
+  it("lists saved profiles in the session order, marks the active one and changes nothing", async () => {
+    const agent = activeAgent("редактор");
+    agent.listProfileIds.mockReturnValue(["автор", "аналитик", "редактор"]);
+    const streams = capture("/profile list\n/PROFILE LIST\n/exit\n");
 
     await runCli(agent, [], streams.io);
 
-    expect(agent.switchUser.mock.calls).toEqual([["Никто"], ["Владимир"], ["Владимир"]]);
+    expect(streams.output()).toContain(
+      "редактор > \n── Профили ──\n\n- автор\n- аналитик\n* редактор — активный\n\nредактор > \n── Профили ──\n",
+    );
+    expect(agent.listProfileIds).toHaveBeenCalledTimes(2);
+    for (const method of mutatingMethods(agent)) expect(method).not.toHaveBeenCalled();
+    expect(streams.error()).toBe("");
+  });
+
+  it("lists profiles without a selection and suggests /profile-init for an empty catalog", async () => {
+    const unselected = activeAgent(null);
+    unselected.listProfileIds.mockReturnValue(["автор"]);
+    const listed = capture("/profile list\n/exit\n");
+    await runCli(unselected, [], listed.io);
+    expect(listed.output()).toContain(
+      "\n── Профили ──\n\n- автор\nПрофиль не выбран: /profile load profileId.\n\nбез профиля > ",
+    );
+
+    const empty = capture("/profile list\n/exit\n");
+    await runCli(activeAgent(null), [], empty.io);
+    expect(empty.output()).toContain(
+      "без профиля > Сохранённых профилей нет. Создайте профиль командой /profile-init.\n\nбез профиля > ",
+    );
+    expect(empty.error()).toBe("");
+  });
+
+  it("rejects /profile list in one-shot mode without reading the catalog", async () => {
+    const agent = activeAgent("редактор");
+    const streams = capture();
+    expect(await runCli(agent, ["/profile", "list"], streams.io)).toBe(1);
+    expect(streams.error()).toBe(
+      "Ошибка · Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n",
+    );
+    expect(agent.listProfileIds).not.toHaveBeenCalled();
+  });
+
+  it("switches profiles, updates the status and prompt only after success", async () => {
+    const agent = activeAgent("редактор");
+    agent.switchProfile.mockImplementationOnce(() => {
+      throw new Error("Профиль «Никто» не найден. Создайте его командой /profile-init.");
+    });
+    const streams = capture("/profile load Никто\n/Profile LOAD автор\n/profile load автор\n/exit\n");
+
+    await runCli(agent, [], streams.io);
+
+    expect(agent.switchProfile.mock.calls).toEqual([["Никто"], ["автор"], ["автор"]]);
     expect(streams.error()).toBe(
       "Ошибка · Команда не выполнена: Профиль «Никто» не найден. Создайте его командой /profile-init.\n",
     );
     const output = streams.output();
-    expect(output).toContain("Макс > \nМакс > Пользователь: Владимир\nКонтекст: sliding\n\nВладимир > ");
-    expect(output).toContain("Владимир > Пользователь «Владимир» уже выбран.\nПользователь: Владимир\n");
-    expect(output).not.toContain("Пользователь: Никто");
+    expect(output).toContain("редактор > \nредактор > Профиль: автор\nКонтекст: sliding\n\nавтор > ");
+    expect(output).toContain("автор > Профиль «автор» уже выбран.\nПрофиль: автор\n");
+    expect(output).not.toContain("Профиль: Никто");
     expect(agent.respond).not.toHaveBeenCalled();
   });
 
   it("sets, deletes and clears groups with case-insensitive names and the whole value", async () => {
-    const agent = activeAgent("Макс");
+    const agent = activeAgent("редактор");
     agent.deleteProfileField.mockReturnValueOnce(true).mockReturnValueOnce(false);
     const streams = capture(
       "/profile set STYLE  На вы,  подробно \n/profile Delete constraints\n/profile delete constraints\n/profile clear\n/exit\n",
@@ -931,18 +983,19 @@ describe("profile commands", () => {
     expect(agent.deleteProfileField.mock.calls).toEqual([["constraints"], ["constraints"]]);
     expect(agent.clearProfile).toHaveBeenCalledOnce();
     const output = streams.output();
-    expect(output).toContain("Группа style сохранена в профиле «Макс».");
-    expect(output).toContain("Группа constraints удалена из профиля «Макс».");
-    expect(output).toContain("Группы constraints нет в профиле «Макс».");
-    expect(output).toContain("Профиль «Макс» очищен. История и память пользователя сохранены.");
+    expect(output).toContain("Группа style сохранена в профиле «редактор».");
+    expect(output).toContain("Группа constraints удалена из профиля «редактор».");
+    expect(output).toContain("Группы constraints нет в профиле «редактор».");
+    expect(output).toContain("Профиль «редактор» очищен. Общие история, память и задача сохранены.");
     expect(streams.error()).toBe("");
     expect(agent.respond).not.toHaveBeenCalled();
   });
 
   it.each([
-    ["/profile list", "Неизвестное действие профиля «list»"],
-    ["/profile load", "Не хватает аргументов. Использование: /profile load userId"],
-    ["/profile load a b", "Лишние аргументы. Использование: /profile load userId"],
+    ["/profile remove автор", "Неизвестное действие профиля «remove»"],
+    ["/profile list all", "Лишние аргументы. Использование: /profile list"],
+    ["/profile load", "Не хватает аргументов. Использование: /profile load profileId"],
+    ["/profile load a b", "Лишние аргументы. Использование: /profile load profileId"],
     ["/profile set", "Не указана группа профиля"],
     ["/profile set mood весело", "Неизвестная группа профиля «mood»"],
     ["/profile set style", "Не хватает аргументов"],
@@ -950,31 +1003,31 @@ describe("profile commands", () => {
     ["/profile delete style extra", "Лишние аргументы"],
     ["/profile clear now", "Лишние аргументы"],
   ])("reports %s with the reason and syntax without changing anything", async (command, reason) => {
-    const agent = activeAgent("Макс");
+    const agent = activeAgent("редактор");
     const streams = capture(`${command}\n/exit\n`);
 
     await runCli(agent, [], streams.io);
 
     expect(streams.error()).toContain(`Ошибка · Команда не выполнена: ${reason}`);
     expect(streams.error()).toContain("Использование: /profile");
-    for (const method of [agent.switchUser, agent.setProfileField, agent.deleteProfileField, agent.clearProfile]) {
+    for (const method of [agent.switchProfile, agent.setProfileField, agent.deleteProfileField, agent.clearProfile]) {
       expect(method).not.toHaveBeenCalled();
     }
   });
 
-  it("reports edits without a selected user and write failures without a false success", async () => {
+  it("reports edits without a selected profile and write failures without a false success", async () => {
     const agent = activeAgent(null);
-    const noUser = new Error("Пользователь не выбран. Запустите /profile-init.");
+    const noProfile = new Error("Профиль не выбран. Запустите /profile-init.");
     for (const method of [agent.setProfileField, agent.deleteProfileField, agent.clearProfile]) {
       method.mockImplementationOnce(() => {
-        throw noUser;
+        throw noProfile;
       });
     }
     const streams = capture("/profile set style кратко\n/profile delete style\n/profile clear\nвопрос\n/exit\n");
 
     await runCli(agent, [], streams.io);
 
-    expect(streams.error()).toBe(`Ошибка · Команда не выполнена: ${noUser.message}\n`.repeat(3));
+    expect(streams.error()).toBe(`Ошибка · Команда не выполнена: ${noProfile.message}\n`.repeat(3));
     expect(streams.output()).not.toContain("сохранена");
     expect(streams.output()).not.toContain("удалена");
     expect(streams.output()).not.toContain("очищен");
@@ -982,13 +1035,13 @@ describe("profile commands", () => {
   });
 
   it("rejects one-shot profile commands without calling the session", async () => {
-    const agent = activeAgent("Макс");
+    const agent = activeAgent("редактор");
     const streams = capture();
-    expect(await runCli(agent, ["/profile", "load", "Владимир"], streams.io)).toBe(1);
+    expect(await runCli(agent, ["/profile", "load", "автор"], streams.io)).toBe(1);
     expect(streams.error()).toBe(
       "Ошибка · Команды доступны только в интерактивном режиме: запустите CLI без аргументов.\n",
     );
-    expect(agent.switchUser).not.toHaveBeenCalled();
+    expect(agent.switchProfile).not.toHaveBeenCalled();
   });
 });
 
@@ -1480,7 +1533,7 @@ describe("colors", () => {
     const agent = taskAgent(null, [result("ответ")]);
     agent.loadProfile.mockReturnValue(null);
     const streams = capture(
-      "/profile-init\nМакс\nНа ты\n\nBackend\n/memory set working goal поездка\n/profile set style кратко\n" +
+      "/profile-init\nредактор\nНа ты\n\nBackend\n/memory set working goal поездка\n/profile set style кратко\n" +
         "/task start описание\nвопрос\n/exit\n",
       { output: "color", error: "color" },
     );
@@ -1492,7 +1545,7 @@ describe("colors", () => {
       (method) => method.mock.calls,
     );
     expect(calls).toEqual([
-      [["Макс", { style: "На ты", context: "Backend" }]],
+      [["редактор", { style: "На ты", context: "Backend" }]],
       [["working", "goal", "поездка"]],
       [["style", "кратко"]],
       [["описание"]],
@@ -1506,10 +1559,10 @@ it("keeps block headings within 40 columns of a narrow terminal", async () => {
     view({ state: "execution", plan: PLAN, results: ["1"], review: { passed: false, text: "исправить" } }),
     [result("ответ")],
   );
-  agent.getActiveUserId.mockReturnValue("Макс");
+  agent.getActiveProfileId.mockReturnValue("редактор");
   agent.getContextStatus = () => ({ strategy: "branching", activeBranch: "main" });
   const streams = capture(
-    "/help\n/task\n/memory\n/profile\n/branches\nвопрос\n/profile-init\nМакс\n/cancel\n/task pause\n/exit\n",
+    "/help\n/task\n/memory\n/profile\n/branches\nвопрос\n/profile-init\nредактор\n/cancel\n/task pause\n/exit\n",
   );
 
   await runCli(agent, [], streams.io);

@@ -2,7 +2,7 @@ import type { Writable } from "node:stream";
 import { styleText } from "node:util";
 import type { AgentResult, ContextStatus, TokenUsage } from "./agent.ts";
 import type { MemoryEntries, MemoryLayer, MemorySnapshot } from "./memory.ts";
-import type { UserProfile } from "./profile.ts";
+import type { AgentProfile } from "./profile.ts";
 import type { TaskContext, TaskState, TaskView } from "./task.ts";
 
 type Tone = "heading" | "user" | "action" | "success" | "error" | "errorLabel" | "muted" | "key" | "doneKey";
@@ -41,7 +41,7 @@ export interface HelpGroup {
 }
 
 export interface ProfileStep {
-  userId: string;
+  profileId: string;
   position: number;
   total: number;
   field: string;
@@ -70,14 +70,14 @@ function printBlock(stream: Writable, title: string, lines: readonly string[]): 
 
 export function printSession(
   output: Writable,
-  userId: string | null,
+  profileId: string | null,
   context: ContextStatus,
   options: { title?: boolean; commandsHint?: boolean } = {},
 ): void {
   if (options.title) output.write(`${paint(output, "heading", "── my-first-agent ──")}\n\n`);
   const branch = context.activeBranch === null ? "" : `, ветка: ${context.activeBranch}`;
   output.write(
-    `${paint(output, "muted", "Пользователь:")} ${paint(output, "user", userId ?? "без профиля")}\n` +
+    `${paint(output, "muted", "Профиль:")} ${paint(output, "user", profileId ?? "без профиля")}\n` +
       `${paint(output, "muted", "Контекст:")} ${context.strategy ?? "без стратегии"}${branch}\n`,
   );
   if (options.commandsHint) output.write(`${paint(output, "muted", "Команды: /help · /task · /memory · /profile")}\n`);
@@ -263,8 +263,19 @@ export function printMemoryLayer<L extends MemoryLayer>(output: Writable, layer:
   printBlock(output, title, [paint(output, "muted", subtitle), ...body]);
 }
 
-export function printProfile(output: Writable, userId: string, profile: UserProfile | null): void {
-  printBlock(output, `Профиль «${userId}»`, entryLines(output, { ...profile }, "Профиль пуст."));
+export function printProfile(output: Writable, profileId: string, profile: AgentProfile | null): void {
+  printBlock(output, `Профиль «${profileId}»`, entryLines(output, { ...profile }, "Профиль пуст."));
+}
+
+export function printProfileList(output: Writable, profileIds: readonly string[], activeId: string | null): void {
+  if (profileIds.length === 0) {
+    printNotice(output, "Сохранённых профилей нет. Создайте профиль командой /profile-init.");
+    return;
+  }
+  printBlock(output, "Профили", [
+    ...profileIds.map((id) => (id === activeId ? paint(output, "key", `* ${id} — активный`) : `- ${id}`)),
+    ...(activeId === null ? [paint(output, "muted", "Профиль не выбран: /profile load profileId.")] : []),
+  ]);
 }
 
 function entryLines(output: Writable, entries: Readonly<Record<string, string>>, empty: string): string[] {
@@ -314,7 +325,7 @@ export function printProfileIntro(output: Writable, question: string): void {
 export function printProfileStep(output: Writable, step: ProfileStep): void {
   const emptyAnswer =
     step.current === undefined ? "Пустой ответ — пропустить группу." : "Пустой ответ — оставить прежнее значение.";
-  printBlock(output, `Профиль «${step.userId}» · ${step.position}/${step.total}`, [
+  printBlock(output, `Профиль «${step.profileId}» · ${step.position}/${step.total}`, [
     `${paint(output, "key", `${step.field}:`)} ${step.question}`,
     paint(output, "muted", `Подсказка: ${step.hint}.`),
     ...(step.current === undefined ? [] : [`${paint(output, "key", "Сейчас:")} ${step.current}`]),

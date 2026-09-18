@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { jsonType } from "./facts.ts";
 import { readTextFile, replaceFile } from "./json-file.ts";
-import { type ProfilesRepository, type ProfilesState, USER_ID_PATTERN } from "./profile.ts";
+import { PROFILE_ID_PATTERN, type ProfilesRepository, type ProfilesState } from "./profile.ts";
 
 // Сообщения не содержат идентификаторов и значений профилей.
 const profileValueSchema = z
@@ -22,14 +22,14 @@ const profileSchema = z.strictObject(
 );
 const stateSchema = z.strictObject(
   {
-    activeUserId: z
-      .string({ error: (issue) => `activeUserId должен быть строкой или null, получено ${jsonType(issue.input)}` })
-      .regex(USER_ID_PATTERN, { error: "недопустимый activeUserId" })
+    activeProfileId: z
+      .string({ error: (issue) => `activeProfileId должен быть строкой или null, получено ${jsonType(issue.input)}` })
+      .regex(PROFILE_ID_PATTERN, { error: "недопустимый activeProfileId" })
       .nullable(),
-    profiles: z.record(z.string().regex(USER_ID_PATTERN), profileSchema, {
+    profiles: z.record(z.string().regex(PROFILE_ID_PATTERN), profileSchema, {
       error: (issue) =>
         issue.code === "invalid_key"
-          ? "недопустимый идентификатор пользователя"
+          ? "недопустимый идентификатор профиля"
           : `profiles должен быть JSON-объектом, получено ${jsonType(issue.input)}`,
     }),
   },
@@ -59,6 +59,11 @@ export class JsonProfilesRepository implements ProfilesRepository {
     } catch {
       throw new Error(`${prefix}: некорректный JSON.`);
     }
+    if (typeof parsed === "object" && parsed !== null && Object.hasOwn(parsed, "activeUserId")) {
+      throw new Error(
+        `${prefix}: прежний формат профилей пользователей (activeUserId). Автоматической миграции нет: перенесите файл и заново настройте профили агента командой /profile-init.`,
+      );
+    }
     return validateState(parsed, prefix);
   }
 
@@ -72,13 +77,13 @@ function validateState(value: unknown, prefix: string): ProfilesState {
   // Zod record молча отбрасывает собственный ключ __proto__ вместо ошибки invalid_key.
   const profiles = typeof value === "object" && value !== null && "profiles" in value ? value.profiles : undefined;
   if (typeof profiles === "object" && profiles !== null && Object.hasOwn(profiles, "__proto__")) {
-    throw new Error(`${prefix}: неверная структура профилей, недопустимый идентификатор пользователя.`);
+    throw new Error(`${prefix}: неверная структура профилей, недопустимый идентификатор профиля.`);
   }
   const result = stateSchema.safeParse(value);
   if (!result.success) throw new Error(`${prefix}: неверная структура профилей, ${result.error.issues[0]!.message}.`);
   const state = result.data;
-  if (state.activeUserId !== null && !Object.hasOwn(state.profiles, state.activeUserId)) {
-    throw new Error(`${prefix}: неверная структура профилей, activeUserId не найден среди профилей.`);
+  if (state.activeProfileId !== null && !Object.hasOwn(state.profiles, state.activeProfileId)) {
+    throw new Error(`${prefix}: неверная структура профилей, activeProfileId не найден среди профилей.`);
   }
   return state;
 }

@@ -1,5 +1,4 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +10,7 @@ const mockApi = fileURLToPath(new URL("./support/mock-api.ts", import.meta.url))
 let workingDirectory: string;
 let historyPath: string;
 const RESET_MESSAGE = "Диалог выбранной стратегии и статистика очищены. Рабочая и долговременная память сохранены.";
-const HEADER = "── my-first-agent ──\n\nПользователь: без профиля\nКонтекст: sliding\n";
+const HEADER = "── my-first-agent ──\n\nПрофиль: без профиля\nКонтекст: sliding\n";
 const COMMANDS_HINT = "Команды: /help · /task · /memory · /profile\n";
 const PAUSE_HINT = "Далее → /task resume, чтобы вернуться к задаче; сейчас реплики идут в обычный чат";
 
@@ -424,77 +423,111 @@ it("rejects one-shot memory commands and stops on corrupted memory without expos
   expect(existsSync(historyPath)).toBe(false);
 });
 
-it("creates two users, switches between them and restores the selected user's context across processes", () => {
+it("switches agent profiles over one shared history, memory and task and restores the selection", () => {
   const env = mockEnvironment();
-  const userPath = (userId: string, file: string) =>
-    join(workingDirectory, ".agent-users", createHash("sha256").update(userId, "utf8").digest("hex"), file);
   const readJson = (path: string) => JSON.parse(readFileSync(path, "utf8"));
 
   const legacy = runProcess(["проверка связи"], undefined, env);
   expect(legacy.status).toBe(0);
   expect(legacy.stdout.startsWith(HEADER)).toBe(true);
   expect(existsSync(join(workingDirectory, ".agent-profiles.json"))).toBe(false);
-  const legacySource = readFileSync(historyPath, "utf8");
 
   const first = runProcess(
     [],
-    "/profile-init\nМакс\nНа ты, списком\nБез эмодзи\nBackend-разработчик\nКод Макса — КЕДР\n" +
-      "/profile-init\nВладимир\nНа вы, таблицей\n\nНачинающий разработчик\nКод Владимира — ДУБ\n/exit\n",
+    "/profile-init\nаналитик\nКороткий бриф списком\nНе придумывай факты\nТы аналитик мероприятий\n" +
+      "/memory set working event Онлайн-встреча, 40 минут\nСоставь бриф\n" +
+      "/profile-init\nавтор\nЖивой текст анонса\n\nТы автор анонсов\n" +
+      "/task start Подготовить анонс встречи\n/task pause\nПроверь роль автора\n/exit\n",
     env,
   );
   expect(first.status).toBe(0);
   expect(first.stderr).toBe("");
-  expect(first.stdout).toContain("без профиля > \n── Настройка профиля ──\n");
   expect(first.stdout).toContain(
-    "Профиль «Макс» сохранён.\nПользователь: Макс\nКонтекст: sliding\n\n── Профиль «Макс» ──\n\n" +
-      "style: На ты, списком\nconstraints: Без эмодзи\ncontext: Backend-разработчик\n\nМакс > ",
+    "Профиль «аналитик» сохранён.\nПрофиль: аналитик\nКонтекст: sliding\n\n── Профиль «аналитик» ──\n\n" +
+      "style: Короткий бриф списком\nconstraints: Не придумывай факты\ncontext: Ты аналитик мероприятий\n\nаналитик > ",
   );
-  expect(first.stdout).toContain("Макс > \n── Ответ агента ──\n\nЭхо: Код Макса — КЕДР\n");
-  expect(first.stdout).toContain("Владимир > \n── Ответ агента ──\n\nЭхо: Код Владимира — ДУБ\n");
-  expect(first.stdout.match(/Ход 8 · сессия 8/g)).toHaveLength(2);
+  expect(first.stdout).toContain("аналитик > \n── Ответ агента ──\n\nЭхо: Составь бриф\n");
+  expect(first.stdout).toContain("\nавтор [задача] > ");
+  expect(first.stdout).toContain(
+    "автор [чат, задача на паузе] > \n── Ответ агента ──\n\nАвтор получил общий контекст.\n",
+  );
+  expect(first.stdout).toContain("Ход 8 · сессия 16");
   expect(readJson(join(workingDirectory, ".agent-profiles.json"))).toEqual({
-    activeUserId: "Владимир",
+    activeProfileId: "автор",
     profiles: {
-      Макс: { style: "На ты, списком", constraints: "Без эмодзи", context: "Backend-разработчик" },
-      Владимир: { style: "На вы, таблицей", context: "Начинающий разработчик" },
+      аналитик: {
+        style: "Короткий бриф списком",
+        constraints: "Не придумывай факты",
+        context: "Ты аналитик мероприятий",
+      },
+      автор: { style: "Живой текст анонса", context: "Ты автор анонсов" },
     },
   });
-  expect(readdirSync(join(workingDirectory, ".agent-users"))).toHaveLength(2);
-  expect(readJson(userPath("Макс", ".agent-history.sliding.json")).messages).toEqual([
-    { role: "user", content: "Код Макса — КЕДР" },
-    { role: "assistant", content: "Эхо: Код Макса — КЕДР" },
-  ]);
-  expect(readFileSync(historyPath, "utf8")).toBe(legacySource);
 
-  const second = runProcess(["Проверь профиль Владимира"], undefined, env);
+  const second = runProcess([], "/profile load аналитик\nПроверь роль аналитика\n/exit\n", env);
   expect(second.status).toBe(0);
   expect(second.stderr).toBe("");
-  expect(second.stdout.startsWith("── my-first-agent ──\n\nПользователь: Владимир\nКонтекст: sliding\n\n")).toBe(true);
-  expect(second.stdout).toContain("Профиль Владимира получен.");
+  expect(second.stdout.startsWith("── my-first-agent ──\n\nПрофиль: автор\nКонтекст: sliding\n")).toBe(true);
+  expect(second.stdout).toContain("автор [чат, задача на паузе] > Профиль: аналитик\nКонтекст: sliding\n");
+  expect(second.stdout).toContain(
+    "\nаналитик [чат, задача на паузе] > \n── Ответ агента ──\n\nАналитик получил общий контекст.\n",
+  );
+  expect(second.stdout).toContain("Ход 8 · сессия 8");
 
-  const third = runProcess(
+  const third = runProcess(["вопрос"], undefined, env);
+  expect(third.status).toBe(0);
+  expect(third.stdout.startsWith("── my-first-agent ──\n\nПрофиль: аналитик\nКонтекст: sliding\n")).toBe(true);
+  expect(readJson(join(workingDirectory, ".agent-profiles.json")).activeProfileId).toBe("аналитик");
+  expect(readJson(historyPath).messages).toHaveLength(10);
+  expect(readJson(join(workingDirectory, ".agent-task.json")).context).toMatchObject({
+    task: "Подготовить анонс встречи",
+    paused: true,
+  });
+  expect(existsSync(join(workingDirectory, ".agent-users"))).toBe(false);
+});
+
+it("replays the profile video script: one request per question with the active profile and shared state", () => {
+  const env = { ...mockEnvironment(), AGENT_CONTEXT_STRATEGY: "" };
+  const profilesPath = join(workingDirectory, ".agent-profiles.json");
+  const demo = readFileSync(fileURLToPath(new URL("../docs/agent-profiles.demo.json", import.meta.url)), "utf8");
+  writeFileSync(profilesPath, demo);
+  const questions = [
+    "Составь краткий бриф и предложи структуру анонса.",
+    "Подготовь анонс по согласованному брифу.",
+    "Проверь подготовленный анонс. Назови конкретные недочёты; если их нет — так и скажи.",
+    "Назови формат, длительность и аудиторию мероприятия, затем напомни результат последней проверки.",
+  ];
+
+  const first = runProcess(
     [],
-    "/profile load Макс\n/memory set long language TypeScript\nПроверь профиль Макса\n/exit\n",
+    "/profile list\n" +
+      "/memory set working event Бесплатная онлайн-встреча «Первый агент», 40 минут, для новичков.\n" +
+      `/profile\n${questions[0]}\n/profile load автор\n${questions[1]}\n/profile load редактор\n${questions[2]}\n/exit\n`,
     env,
   );
-  expect(third.status).toBe(0);
-  expect(third.stderr).toBe("");
-  expect(third.stdout).toContain("Владимир > Пользователь: Макс\nКонтекст: sliding\n\nМакс > ");
-  expect(third.stdout).toContain("Профиль Макса получен.");
-  expect(readJson(userPath("Макс", ".agent-memory.long-term.json"))).toEqual({ language: "TypeScript" });
-  expect(existsSync(userPath("Владимир", ".agent-memory.long-term.json"))).toBe(false);
-  expect(existsSync(join(workingDirectory, ".agent-memory.long-term.json"))).toBe(false);
+  expect(first.status).toBe(0);
+  expect(first.stderr).toBe("");
+  expect(first.stdout.startsWith("── my-first-agent ──\n\nПрофиль: аналитик\nКонтекст: без стратегии\n")).toBe(true);
+  expect(first.stdout).toContain("── Профили ──\n\n- автор\n* аналитик — активный\n- редактор\n");
+  expect(first.stdout).toContain("\n── Профиль «аналитик» ──\n\nstyle: Кратко");
+  expect(first.stdout).toContain(`редактор > \n── Ответ агента ──\n\nЭхо: ${questions[2]}\n`);
+  expect(first.stdout.split("── Токены ──")).toHaveLength(4);
+  expect(first.stdout).toContain("Ход 8 · сессия 24");
 
-  const fourth = runProcess(["Проверь профиль Макса"], undefined, env);
-  expect(fourth.status).toBe(0);
-  expect(fourth.stderr).toBe("");
-  expect(fourth.stdout.startsWith("── my-first-agent ──\n\nПользователь: Макс\nКонтекст: sliding\n\n")).toBe(true);
-  expect(fourth.stdout).toContain("Профиль Макса получен.");
-  expect(fourth.stdout).toContain("Ход 8 · сессия 8");
-  expect(readJson(join(workingDirectory, ".agent-profiles.json")).activeUserId).toBe("Макс");
-  expect(readJson(userPath("Макс", ".agent-history.sliding.json")).messages).toHaveLength(6);
-  expect(readJson(userPath("Владимир", ".agent-history.sliding.json")).messages).toHaveLength(4);
-  expect(readFileSync(historyPath, "utf8")).toBe(legacySource);
+  const second = runProcess([], `${questions[3]}\n/exit\n`, env);
+  expect(second.status).toBe(0);
+  expect(second.stderr).toBe("");
+  expect(second.stdout).toContain("Профиль: редактор\n");
+  expect(second.stdout).toContain(`редактор > \n── Ответ агента ──\n\nЭхо: ${questions[3]}\n`);
+  expect(second.stdout).toContain("Ход 8 · сессия 8");
+
+  expect(JSON.parse(readFileSync(profilesPath, "utf8"))).toEqual({ ...JSON.parse(demo), activeProfileId: "редактор" });
+  expect(JSON.parse(readFileSync(join(workingDirectory, ".agent-history.json"), "utf8")).messages).toHaveLength(8);
+  expect(readdirSync(workingDirectory).sort()).toEqual([
+    ".agent-history.json",
+    ".agent-memory.working.json",
+    ".agent-profiles.json",
+  ]);
 });
 
 it("runs a task through a pause, an ordinary chat and a restart, sharing it with another strategy", () => {

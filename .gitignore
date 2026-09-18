@@ -22,7 +22,7 @@ coverage/
 .agent-task.json
 .agent-task.json.*.tmp
 
-# Каталог профилей и личные данные пользователей.
+# Каталог профилей агента и каталоги пользователей прежней версии.
 .agent-profiles.json
 .agent-profiles.json.*.tmp
 .agent-users/

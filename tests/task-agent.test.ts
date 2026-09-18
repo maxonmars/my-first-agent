@@ -13,7 +13,7 @@ import {
 import { DEFAULT_AGENT_CONFIG } from "../src/config.ts";
 import { emptyHistory, type HistoryRepository, type HistoryState } from "../src/history.ts";
 import { LONG_TERM_MEMORY_TITLE, MEMORY_INSTRUCTION, type MemoryEntries, WORKING_MEMORY_TITLE } from "../src/memory.ts";
-import { PROFILE_INSTRUCTION, PROFILE_TITLE, type UserProfile } from "../src/profile.ts";
+import { type AgentProfile, PROFILE_INSTRUCTION, PROFILE_TITLE } from "../src/profile.ts";
 import { jsonAgentRepositories } from "../src/session.ts";
 import {
   TASK_INSTRUCTION,
@@ -65,7 +65,7 @@ interface SetupOptions {
   replies?: Array<FakeReply | Error>;
   config?: Partial<AgentConfig>;
   history?: HistoryState;
-  provider?: () => UserProfile;
+  provider?: () => AgentProfile;
   working?: MemoryEntries;
   long?: MemoryEntries;
 }
@@ -258,7 +258,7 @@ it("keeps the task in the agent instance without a repository", async () => {
 
 describe("task turns", () => {
   it("sends profile, long and working memory, then the task block, the task dialog and the reply", async () => {
-    const profile: UserProfile = { style: "На вы" };
+    const profile: AgentProfile = { style: "На вы" };
     const initial = task({ state: "execution", plan: PLAN }, pair("Продолжай", "Предлагаю два шага."));
     const { agent, calls } = setup({
       initial,
@@ -604,7 +604,7 @@ describe("task persistence across agent instances", () => {
     const agent = new Agent({
       client: fake.client,
       config: { ...DEFAULT_AGENT_CONFIG, contextStrategy },
-      ...jsonAgentRepositories(directory, null, contextStrategy),
+      ...jsonAgentRepositories(directory, contextStrategy),
     });
     return { ...fake, agent };
   }
