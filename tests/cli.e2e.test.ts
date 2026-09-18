@@ -501,6 +501,10 @@ it("replays the profile video script: one request per question with the active p
   const first = runProcess(
     [],
     "/profile list\n" +
+      "/profile-init\nавтор\nЖивой дружелюбный текст анонса до 120 слов: заголовок, основной текст, призыв к действию\n" +
+      "Следуй согласованному брифу. Не добавляй дату, ссылку, спикеров и другие неподтверждённые факты; вместо них оставь пометку [уточнить]\n" +
+      "Ты автор анонсов мероприятий. Пишешь текст для публикации по согласованному брифу\n" +
+      "/profile load аналитик\n/profile list\n" +
       "/memory set working event Бесплатная онлайн-встреча «Первый агент», 40 минут, для новичков.\n" +
       `/profile\n${questions[0]}\n/profile load автор\n${questions[1]}\n/profile load редактор\n${questions[2]}\n/exit\n`,
     env,
@@ -521,7 +525,18 @@ it("replays the profile video script: one request per question with the active p
   expect(second.stdout).toContain(`редактор > \n── Ответ агента ──\n\nЭхо: ${questions[3]}\n`);
   expect(second.stdout).toContain("Ход 8 · сессия 8");
 
-  expect(JSON.parse(readFileSync(profilesPath, "utf8"))).toEqual({ ...JSON.parse(demo), activeProfileId: "редактор" });
+  expect(JSON.parse(readFileSync(profilesPath, "utf8"))).toEqual({
+    activeProfileId: "редактор",
+    profiles: {
+      ...JSON.parse(demo).profiles,
+      автор: {
+        style: "Живой дружелюбный текст анонса до 120 слов: заголовок, основной текст, призыв к действию",
+        constraints:
+          "Следуй согласованному брифу. Не добавляй дату, ссылку, спикеров и другие неподтверждённые факты; вместо них оставь пометку [уточнить]",
+        context: "Ты автор анонсов мероприятий. Пишешь текст для публикации по согласованному брифу",
+      },
+    },
+  });
   expect(JSON.parse(readFileSync(join(workingDirectory, ".agent-history.json"), "utf8")).messages).toHaveLength(8);
   expect(readdirSync(workingDirectory).sort()).toEqual([
     ".agent-history.json",

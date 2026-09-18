@@ -28,9 +28,16 @@ const sharedContext = [
 ];
 
 // Шаги docs/profile-video-prompts.md: вопрос и профиль, активный на этом шаге.
-const demoProfiles = JSON.parse(
-  readFileSync(new URL("../../docs/agent-profiles.demo.json", import.meta.url), "utf8"),
-).profiles;
+// «автор» создаётся во время сценария через /profile-init и в демо-файле не хранится.
+const demoProfiles = {
+  ...JSON.parse(readFileSync(new URL("../../docs/agent-profiles.demo.json", import.meta.url), "utf8")).profiles,
+  автор: {
+    style: "Живой дружелюбный текст анонса до 120 слов: заголовок, основной текст, призыв к действию",
+    constraints:
+      "Следуй согласованному брифу. Не добавляй дату, ссылку, спикеров и другие неподтверждённые факты; вместо них оставь пометку [уточнить]",
+    context: "Ты автор анонсов мероприятий. Пишешь текст для публикации по согласованному брифу",
+  },
+};
 const demoEvent = "Бесплатная онлайн-встреча «Первый агент», 40 минут, для новичков.";
 const demoTurns = [
   { question: "Составь краткий бриф и предложи структуру анонса.", profileId: "аналитик" },

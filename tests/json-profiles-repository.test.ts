@@ -112,7 +112,7 @@ describe("JSON profiles repository", () => {
     );
     const loaded = demo.load()!;
     expect(loaded.activeProfileId).toBe("аналитик");
-    expect(Object.keys(loaded.profiles)).toEqual(["аналитик", "автор", "редактор"]);
+    expect(Object.keys(loaded.profiles)).toEqual(["аналитик", "редактор"]);
   });
 
   it("rejects the legacy user catalog without changing the file", () => {
