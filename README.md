@@ -358,7 +358,7 @@ system + инструкции профиля, инвариантов и памя
 - К переписке задачи не применяются compression, окно, facts и ветки. Автоматического сжатия нет: контекст растёт до бюджета, подсказка при переполнении предлагает `/task clear` или `/task pause`.
 - Одна задача на рабочий каталог, без архива. `replan` в первой версии начинает выполнение заново: старые результаты остаются только в переписке. Работы с файлами, запуска команд и отправки сообщений нет.
 
-Сценарий короткого видео: [docs/task-video-prompts.md](docs/task-video-prompts.md).
+Сценарий короткого видео: [docs/task-video-prompts.md](docs/task-video-prompts.md). Попытки пропустить этапы, пауза и перезапуск на validation: [docs/controlled-transitions-video-prompts.md](docs/controlled-transitions-video-prompts.md).
 
 ## Инварианты ответа
 

@@ -231,7 +231,8 @@ export function taskSnapshotProblem({ context, messages }: TaskSnapshot): string
 
 /** Разбирает ответ модели строгой схемой; сообщение называет поле и причину без содержимого ответа. */
 export function parseTaskReply(text: string): TaskReply {
-  if (text.trim().length === 0) throw new TaskError("пустой ответ");
+  if (text.length === 0) throw new TaskError("пустой ответ");
+  if (text.trim().length === 0) throw new TaskError("ответ без текста: только пробельные символы");
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

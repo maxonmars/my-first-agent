@@ -490,7 +490,12 @@ describe("task turns", () => {
 describe("rejected task turns", () => {
   it.each<{ name: string; reply: FakeReply; reason: string }>([
     { name: "invalid JSON", reply: { content: '{"action":"reply"', totalTokens: 7 }, reason: "некорректный JSON" },
-    { name: "empty content", reply: { content: " ", totalTokens: 7 }, reason: "пустой ответ" },
+    { name: "empty content", reply: { content: "", totalTokens: 7 }, reason: "пустой ответ" },
+    {
+      name: "whitespace-only content",
+      reply: { content: " ".repeat(5), totalTokens: 7 },
+      reason: "ответ без текста: только пробельные символы",
+    },
     {
       name: "unknown field with private name",
       reply: json({ action: "reply", answer: "Ответ", PRIVATE_TASK_CONTENT_123: true }, { totalTokens: 7 }),
