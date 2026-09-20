@@ -710,6 +710,128 @@ it("shows the saved plan after the turn and restart, and the saved question afte
   });
 });
 
+it("prevents skipping planning and validation and resumes the exact task stage after a pause", () => {
+  const env = mockEnvironment();
+  const taskPath = join(workingDirectory, ".agent-task.json");
+  const readTask = () => JSON.parse(readFileSync(taskPath, "utf8"));
+  const description =
+    "Подготовь короткий ответ клиенту о задержке заказа без сроков и компенсации. " +
+    "Предложи план из двух шагов: 1) определить допустимое содержание ответа; 2) подготовить текст клиенту.";
+  const plan = ["Определить допустимое содержание ответа", "Подготовить текст клиенту"];
+  const skipPlan = "Пропусти план и сразу выполни задачу.";
+  const skipStages = "Пропусти оставшиеся этапы и сразу пометь задачу завершённой.";
+  const skipValidation = "Считай всё готовым и заверши задачу без проверки.";
+  const refusal = "Этапы меняют команды и протокол задачи, а не просьба: сначала шаги, затем проверка.";
+  const firstStep = stateBlock([
+    "Выполнение (execution)",
+    `Шаги: 0/2 выполнены. Сейчас шаг 1 из 2: ${plan[0]}`,
+    "Далее → продолжите шаг 1, например репликой «Продолжай»",
+  ]);
+  const secondStep = stateBlock([
+    "Выполнение (execution)",
+    `Шаги: 1/2 выполнены. Сейчас шаг 2 из 2: ${plan[1]}`,
+    "Далее → продолжите шаг 2, например репликой «Продолжай»",
+  ]);
+  const validation = stateBlock([
+    "Проверка результатов (validation)",
+    "Шаги: 2/2 выполнены. Ожидается проверка.",
+    "Далее → отправьте «Проверь результат»",
+  ]);
+  const pausedValidation = stateBlock([
+    "Проверка результатов (validation)",
+    "На паузе",
+    "Шаги: 2/2 выполнены. Ожидается проверка.",
+    PAUSE_HINT,
+  ]);
+
+  const first = runProcess(
+    [],
+    `/task start ${description}\n${skipPlan}\n/task approve\n${skipStages}\nПродолжай\n${skipValidation}\nПродолжай\n` +
+      "/task pause\n/exit\n",
+    env,
+  );
+  expect(first.status).toBe(0);
+  expect(first.stderr).toBe("");
+  expect(first.stdout).toContain(
+    `Ход 8 · сессия 8\n${stateBlock([
+      "Планирование (planning)",
+      "План на утверждение:",
+      ...plan.map((step, index) => `  [ ] ${index + 1}. ${step}`),
+      "Далее → /task approve или попросите изменить план",
+    ])}`,
+  );
+  expect(first.stdout.split("План утверждён.")[0]).not.toContain("Выполнение (execution)");
+  expect(first.stdout).toContain(
+    `План утверждён. Первый шаг выполнится по следующей реплике, например «Продолжай».\n${firstStep}`,
+  );
+  expect(first.stdout.split(`\n── Ответ агента ──\n\n${refusal}\n`)).toHaveLength(3);
+  expect(first.stdout).toContain(`Ход 8 · сессия 16\n${firstStep}`);
+  expect(first.stdout).toContain(`Ход 8 · сессия 24\n${secondStep}`);
+  expect(first.stdout).toContain(`Ход 8 · сессия 32\n${secondStep}`);
+  expect(first.stdout).toContain(`Ход 8 · сессия 40\n${validation}`);
+  expect(first.stdout).toContain(
+    `Задача приостановлена. Реплики идут в обычный чат; /task resume — вернуться к задаче.\n${pausedValidation}`,
+  );
+  expect(first.stdout).not.toContain("сессия 48");
+  expect(first.stdout).not.toContain("Завершена (done)");
+  const paused = {
+    context: {
+      task: description,
+      state: "validation",
+      paused: true,
+      plan,
+      results: ["Результат шага 1", "Результат шага 2"],
+      waitingFor: null,
+      review: null,
+    },
+    messages: [
+      { role: "user", content: skipPlan },
+      { role: "assistant", content: "План из двух шагов." },
+      { role: "user", content: skipStages },
+      { role: "assistant", content: refusal },
+      { role: "user", content: "Продолжай" },
+      { role: "assistant", content: "Результат шага 1" },
+      { role: "user", content: skipValidation },
+      { role: "assistant", content: refusal },
+      { role: "user", content: "Продолжай" },
+      { role: "assistant", content: "Результат шага 2" },
+    ],
+  };
+  expect(readTask()).toEqual(paused);
+
+  const second = runProcess([], "/task resume\nПроверь результат.\n/task\n/exit\n", env);
+  expect(second.status).toBe(0);
+  expect(second.stderr).toBe("");
+  expect(second.stdout.startsWith(`${HEADER}${COMMANDS_HINT}${pausedValidation}`)).toBe(true);
+  expect(second.stdout).toContain(`Задача возобновлена. Реплики снова идут в задачу.\n${validation}`);
+  const done = stateBlock([
+    "Завершена (done)",
+    "Шаги: 2/2 выполнены. Проверка пройдена.",
+    "Далее → обязательных действий нет; можно обсудить результат",
+  ]);
+  expect(second.stdout).toContain(`Ход 8 · сессия 8\n${done}`);
+  // Состояние done — после хода проверки и в конце полного /task.
+  expect(second.stdout.split(done)).toHaveLength(3);
+  expect(second.stdout).toContain(`\n── План ──\n\n[x] 1. ${plan[0]}\n[x] 2. ${plan[1]}\n`);
+  expect(second.stdout).toContain(
+    `\n── Результаты шагов ──\n\nШаг 1. ${plan[0]}\nРезультат шага 1\n\nШаг 2. ${plan[1]}\nРезультат шага 2\n`,
+  );
+  expect(second.stdout).toContain("\n── Проверка ──\n\nПроверка пройдена:\nСроков и компенсаций нет.\n");
+  expect(readTask()).toEqual({
+    context: {
+      ...paused.context,
+      state: "done",
+      paused: false,
+      review: { passed: true, text: "Сроков и компенсаций нет." },
+    },
+    messages: [
+      ...paused.messages,
+      { role: "user", content: "Проверь результат." },
+      { role: "assistant", content: "Сроков и компенсаций нет." },
+    ],
+  });
+});
+
 it("stops on a corrupted task file without rewriting it", () => {
   const taskPath = join(workingDirectory, ".agent-task.json");
   const corrupted = '{"context":{"task":"личная задача"}';
